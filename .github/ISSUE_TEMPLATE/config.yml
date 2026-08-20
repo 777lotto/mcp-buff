@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/777lotto/mcp-buff/security/advisories/new
+    about: Report approval bypasses, endpoint escapes, command construction, or ticket-data exposure privately.

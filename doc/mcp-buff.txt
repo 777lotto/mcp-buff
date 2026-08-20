@@ -1,0 +1,144 @@
+*mcp-buff.txt* *mcp-buff*       Reviewed mcp-broker tickets in Neovim
+
+==============================================================================
+CONTENTS                                                     *mcp-buff-contents*
+
+1. Requirements ......................................... |mcp-buff-requirements|
+2. Installation ......................................... |mcp-buff-installation|
+3. Tunnel ..................................................... |mcp-buff-tunnel|
+4. Command and keys ......................................... |mcp-buff-commands|
+5. Review flow ................................................ |mcp-buff-review|
+6. Configuration ............................................. |mcp-buff-config|
+7. Lua API ....................................................... |mcp-buff-api|
+8. Security ................................................ |mcp-buff-security|
+9. Development .......................................... |mcp-buff-development|
+
+==============================================================================
+1. REQUIREMENTS                                           *mcp-buff-requirements*
+
+Neovim 0.10 or newer, curl on $PATH, and an SSH local forward to an installed
+mcp-broker admin listener. McpBuff has no Lua or Neovim plugin dependencies.
+
+It never accepts a Cloudflare token and never calls Cloudflare directly.
+
+==============================================================================
+2. INSTALLATION                                           *mcp-buff-installation*
+
+With lazy.nvim: >lua
+
+    {
+      "777lotto/mcp-buff",
+      main = "mcp_buff",
+      cmd = { "McpBuff" },
+      keys = {
+        { "<leader>mb", "<cmd>McpBuff<cr>",
+          desc = "Cloudflare write tickets" },
+      },
+      opts = {
+        endpoint = "http://127.0.0.1:8792",
+      },
+    }
+<
+Calling setup() is optional when the default endpoint is correct.
+
+==============================================================================
+3. TUNNEL                                                       *mcp-buff-tunnel*
+
+Open the local forward on the Toughbook before starting the panel: >sh
+
+    ssh -N -L 8792:127.0.0.1:8792 zed@10.0.0.7
+<
+Keep the SSH process running while reviewing. Stopping it revokes access.
+Never bind the local side to 0.0.0.0.
+
+==============================================================================
+4. COMMAND AND KEYS                                          *mcp-buff-commands*
+
+:McpBuff        Open the ticket panel as a left split.
+
+The following mappings are local to the panel buffer:
+
+<CR>            Re-fetch and open the full ticket detail. LF and keypad Enter
+                perform the same action.
+a               Re-fetch and approve a pending ticket after exact review and
+                confirmation.
+d               Re-fetch and deny a pending ticket with an optional note and
+                final confirmation.
+r               Refresh the ticket list.
+q               Close the panel. In detail, q or <Esc> closes the float.
+
+==============================================================================
+5. REVIEW FLOW                                                 *mcp-buff-review*
+
+The panel groups tickets pending-first, followed by approved, executing,
+failed, denied, expired, and executed. Rows show age, the complete ticket ID,
+and a reason excerpt.
+
+<CR> opens the full reason and each stored request as method, literal path,
+and pretty-printed JSON body. Executed or failed tickets also show every
+result, response, error, HTTP status, and step index.
+
+Approval never acts from the summary cache alone. It fetches the full ticket,
+requires status=pending, and shows every stored request in a confirmation.
+Only the explicit Approve choice calls the synchronous broker endpoint. The
+returned final ticket opens immediately, including partial failure results.
+
+The plugin cannot edit a ticket and supplies no requests at approval time.
+
+==============================================================================
+6. CONFIGURATION                                             *mcp-buff-config*
+
+Default configuration: >lua
+
+    require("mcp_buff").setup({
+      endpoint = "http://127.0.0.1:8792",
+      curl_command = "curl",
+      timeout = 300000,      -- milliseconds
+      refresh_interval = 0,  -- seconds; automatic refresh is off
+    })
+<
+endpoint must use the exact shape http://127.0.0.1:PORT. Remote, bridge, HTTPS,
+path-bearing, and credential-bearing values are rejected.
+
+A positive whole refresh_interval enables the optional background timer.
+Manual r remains available. The approval timeout is deliberately longer than
+ordinary list requests because the broker executes the approved chain before
+returning.
+
+==============================================================================
+7. LUA API                                                         *mcp-buff-api*
+
+The module is returned by: >lua
+
+    local buff = require("mcp_buff")
+    buff.setup({})
+    buff.open()
+    buff.refresh()
+    buff.pending_count()
+    buff.close()
+<
+pending_count() is nonblocking and returns the latest cached count. It returns
+0 before the first successful refresh. This makes it safe for statuslines.
+
+==============================================================================
+8. SECURITY                                                   *mcp-buff-security*
+
+McpBuff speaks only the loopback broker admin API through curl. Curl user
+configuration and redirects are disabled. JSON request bodies travel on
+standard input, not argv. No shell is involved.
+
+The SSH account and local forward are the authority boundary. The plugin has
+no authentication mechanism because the broker admin listener itself is
+loopback-only. Close the tunnel after review.
+
+==============================================================================
+9. DEVELOPMENT                                             *mcp-buff-development*
+
+Linux is tested on Neovim 0.10, 0.11, and 0.12. macOS is smoke-tested on
+Neovim 0.12. The dependency-free Node stub provides a real loopback admin API
+for the headless smoke suite. No test reaches a box or Cloudflare.
+
+Development branches start from and merge into bluff. Tested releases promote
+bluff into bet.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

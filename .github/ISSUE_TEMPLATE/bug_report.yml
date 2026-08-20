@@ -1,0 +1,79 @@
+name: Bug report
+description: Report a reproducible McpBuff problem
+title: "[Bug]: "
+labels:
+  - "type:bug"
+  - "status:needs-triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for providing a focused reproduction. Report approval or endpoint security issues privately through the Security tab.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - macOS
+        - Windows (untested)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: nvim-version
+    attributes:
+      label: Neovim version
+      description: Paste the first line of `nvim --version`.
+      placeholder: NVIM v0.12.4
+    validations:
+      required: true
+  - type: input
+    id: curl-version
+    attributes:
+      label: curl version
+      description: Paste the first line of `curl --version`.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: McpBuff revision
+      description: Commit SHA or release tag.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic ticket data and include the smallest reliable command/key sequence.
+      placeholder: |
+        1. Start a loopback stub ...
+        2. Open `:McpBuff`
+        3. Press ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and logs
+      description: Remove credentials, real account/zone IDs, ticket reasons, and private responses.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I reproduced this on the current `bluff` branch.
+          required: true
+        - label: I checked existing issues for the same problem.
+          required: true
+        - label: I replaced live ticket and infrastructure data with synthetic fixtures.
+          required: true
