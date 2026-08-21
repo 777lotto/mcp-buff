@@ -1,0 +1,57 @@
+name: Feature request
+description: Propose a focused McpBuff improvement
+title: "[Feature]: "
+labels:
+  - "type:feature"
+  - "status:needs-triage"
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Ticket list
+        - Ticket detail
+        - Approval and denial
+        - Refresh and statusline
+        - Admin transport
+        - Documentation
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform scope
+      options:
+        - Portable / all platforms
+        - Linux
+        - macOS
+        - Windows (untested)
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Explain the operator review gap before proposing an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I checked existing issues for similar work.
+          required: true
+        - label: The proposal preserves loopback-only authority and exact pre-execution confirmation.
+          required: true
