@@ -1,6 +1,6 @@
 # mcp-buff
 
-[![CI](https://github.com/777lotto/mcp-buff/actions/workflows/ci.yml/badge.svg?branch=bluff)](https://github.com/777lotto/mcp-buff/actions/workflows/ci.yml)
+[![CI](https://github.com/777lotto/mcp-buff/actions/workflows/ci.yml/badge.svg?branch=bet)](https://github.com/777lotto/mcp-buff/actions/workflows/ci.yml)
 [![Neovim](https://img.shields.io/badge/Neovim-0.10%2B-57A143?logo=neovim&logoColor=white)](https://neovim.io/)
 [![Release](https://img.shields.io/github/v/release/777lotto/mcp-buff)](https://github.com/777lotto/mcp-buff/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -181,10 +181,17 @@ finished.
 
 ## Branch and release model
 
-- `bet` is the production branch once the first tested release is promoted.
-- `bluff` is the persistent integration/default branch.
+- `bet` is the production/default branch.
+- `bluff` is the persistent integration branch.
 - Focused branches merge into `bluff`; releases promote `bluff` into `bet`.
 - Signed `vX.Y.Z` tags identify releases.
+
+Each push to production `bet` can request a focused `mcp-buff` lockfile refresh
+in `777lotto/nvim-config`. Configure the plugin repository secret
+`NVIM_CONFIG_DISPATCH_TOKEN` with a fine-grained token scoped only to
+`777lotto/nvim-config` and its Contents permission set to write. If the secret
+is absent, the notification workflow exits successfully with a setup notice;
+it never changes the plugin loopback, SSH, or network boundary.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for checks and pull-request guidance.
 
