@@ -5,8 +5,8 @@ the proposed behavior.
 
 ## Branch model
 
-- `bet` is the production branch after the first release promotion.
-- `bluff` is the persistent integration/default branch.
+- `bet` is the production/default branch.
+- `bluff` is the persistent integration branch.
 - Short-lived work branches start from and return to `bluff`.
 - A `bluff` → `bet` pull request promotes a tested release candidate.
 
