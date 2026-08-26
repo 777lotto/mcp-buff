@@ -6,6 +6,9 @@ M.status_order = {
   'pending',
   'approved',
   'executing',
+  -- indeterminate is a state of its own. Bucketing an unknown outcome with
+  -- failed is the one presentation it must never be given.
+  'indeterminate',
   'failed',
   'denied',
   'expired',
@@ -18,6 +21,7 @@ local STATUS_LABELS = {
   executing = 'Executing',
   executed = 'Executed',
   failed = 'Failed',
+  indeterminate = 'Indeterminate',
   denied = 'Denied',
   expired = 'Expired',
 }
@@ -28,6 +32,7 @@ local STATUS_HIGHLIGHTS = {
   executing = 'McpBuffExecuting',
   executed = 'McpBuffExecuted',
   failed = 'McpBuffFailed',
+  indeterminate = 'McpBuffIndeterminate',
   denied = 'McpBuffDenied',
   expired = 'McpBuffExpired',
 }
@@ -206,21 +211,13 @@ local function json_block(lines, value)
   lines[#lines + 1] = '```'
 end
 
-function M.detail(ticket)
-  local lines = {
-    '# Ticket `' .. tostring(ticket.id or '?') .. '`',
-    '',
-    '- **Status:** ' .. tostring(ticket.status or '?'),
-    '- **Created:** ' .. tostring(ticket.created or '?'),
-    '- **Expires:** ' .. tostring(ticket.expires or '?'),
-    '',
-    '## Reason',
-    '',
-    tostring(ticket.reason or ''),
-    '',
-    '## Stored requests',
-  }
+local function bullet(label, value)
+  return ('- **%s:** %s'):format(label, tostring(value))
+end
 
+local function request_lines(lines, ticket)
+  lines[#lines + 1] = ''
+  lines[#lines + 1] = '## Stored requests'
   for index, request in ipairs(ticket.requests or {}) do
     lines[#lines + 1] = ''
     lines[#lines + 1] = ('### Step %d'):format(index - 1)
@@ -232,31 +229,127 @@ function M.detail(ticket)
     else
       json_block(lines, request.body)
     end
-  end
 
+    -- The structured precondition is part of what the operator reviews: it is
+    -- inside the digest, and it is the evidence the broker will re-check.
+    local precondition = request.precondition
+    lines[#lines + 1] = ''
+    if type(precondition) ~= 'table' then
+      lines[#lines + 1] = '_No stored precondition._'
+    else
+      lines[#lines + 1] = ('**Precondition:** `%s %s`'):format(
+        tostring(precondition.method or '?'), tostring(precondition.path or '?'))
+      local expect = precondition.expect
+      if type(expect) == 'table' then
+        lines[#lines + 1] = ''
+        lines[#lines + 1] = bullet('Expected status', expect.status or '?')
+        if expect.result_sha256 then
+          lines[#lines + 1] = bullet('Expected result_sha256', expect.result_sha256)
+        end
+        if expect.etag then
+          lines[#lines + 1] = bullet('Expected ETag', expect.etag)
+        end
+      end
+    end
+  end
+end
+
+local function preflight_lines(lines, ticket)
+  lines[#lines + 1] = ''
+  lines[#lines + 1] = '## Preflight observations'
+  local observations = ticket.preflight_results or {}
+  if #observations == 0 then
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = '_No precondition has been checked._'
+    return
+  end
+  for _, observation in ipairs(observations) do
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = ('### Step %s · %s · %s'):format(
+      tostring(observation.index or '?'),
+      tostring(observation.phase or '?'),
+      observation.matched and 'matched' or 'DID NOT MATCH')
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = bullet('Checked', observation.checked or '?')
+    lines[#lines + 1] = ('- **Status:** expected %s, observed %s'):format(
+      tostring(observation.expected_status or '?'),
+      tostring(observation.observed_status or 'none'))
+    if observation.expected_result_sha256 or observation.observed_result_sha256 then
+      lines[#lines + 1] = ('- **result_sha256:** expected %s, observed %s'):format(
+        tostring(observation.expected_result_sha256 or 'none'),
+        tostring(observation.observed_result_sha256 or 'none'))
+    end
+    if observation.expected_etag or observation.observed_etag then
+      lines[#lines + 1] = ('- **ETag:** expected %s, observed %s'):format(
+        tostring(observation.expected_etag or 'none'),
+        tostring(observation.observed_etag or 'none'))
+    end
+    if observation.error_id then
+      lines[#lines + 1] = bullet('Error id', observation.error_id)
+    end
+  end
+end
+
+local function result_lines(lines, ticket)
   lines[#lines + 1] = ''
   lines[#lines + 1] = '## Results'
   if #(ticket.results or {}) == 0 then
     lines[#lines + 1] = ''
     lines[#lines + 1] = '_No request has executed._'
-  else
-    for _, result in ipairs(ticket.results) do
+    return
+  end
+  for _, result in ipairs(ticket.results) do
+    lines[#lines + 1] = ''
+    -- outcome is the broker's own word for what happened. "indeterminate" here
+    -- means the mutation may or may not have reached Cloudflare.
+    local outcome = tostring(result.outcome or (result.ok and 'succeeded' or 'rejected'))
+    local status = result.status and ('HTTP ' .. tostring(result.status)) or 'no HTTP response'
+    lines[#lines + 1] = ('### Step %s · %s · %s'):format(
+      tostring(result.index or '?'), outcome, status)
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = ('`%s %s`'):format(tostring(result.method or '?'), tostring(result.path or '?'))
+    if result.error then
       lines[#lines + 1] = ''
-      local outcome = result.ok and 'ok' or 'FAILED'
-      local status = result.status and ('HTTP ' .. tostring(result.status)) or 'no HTTP response'
-      lines[#lines + 1] = ('### Step %s · %s · %s'):format(
-        tostring(result.index or '?'), outcome, status)
-      lines[#lines + 1] = ''
-      lines[#lines + 1] = ('`%s %s`'):format(tostring(result.method or '?'), tostring(result.path or '?'))
-      if result.error then
-        lines[#lines + 1] = ''
-        lines[#lines + 1] = '**Error:** ' .. tostring(result.error)
-      end
-      lines[#lines + 1] = ''
-      json_block(lines, result.response)
+      lines[#lines + 1] = '**Error:** ' .. tostring(result.error)
     end
+    lines[#lines + 1] = ''
+    json_block(lines, result.response)
+  end
+end
+
+function M.detail(ticket)
+  local lines = {
+    '# Ticket `' .. tostring(ticket.id or '?') .. '`',
+    '',
+    bullet('Status', ticket.status or '?'),
+    bullet('Created', ticket.created or '?'),
+    -- expires is rendered on every path: a ticket can expire between the read
+    -- and the decision, and the operator has to be able to see that coming.
+    bullet('Expires', ticket.expires or '?'),
+    bullet('Requests', #(ticket.requests or {})),
+    '',
+    '- **ticket_sha256:**',
+    '  `' .. tostring(ticket.ticket_sha256 or 'missing') .. '`',
+    '',
+    '## Reason',
+    '',
+    tostring(ticket.reason or ''),
+  }
+
+  request_lines(lines, ticket)
+  preflight_lines(lines, ticket)
+  result_lines(lines, ticket)
+
+  if ticket.status == 'indeterminate' then
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = '## Indeterminate'
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = 'The outcome of this ticket is genuinely unknown: a mutation '
+      .. 'may or may not have reached Cloudflare. Inspect it upstream. This is not '
+      .. 'a retry signal, and this ticket must never be replayed.'
   end
 
+  -- The broker returns the denial reason as denial_note, not note.
   if ticket.denial_note then
     lines[#lines + 1] = ''
     lines[#lines + 1] = '## Denial note'
@@ -268,25 +361,20 @@ function M.detail(ticket)
   return table.concat(lines, '\n')
 end
 
-function M.approval(ticket)
-  local lines = {
-    'Approve and execute this stored ticket exactly as shown?',
-    '',
-    'Ticket: ' .. tostring(ticket.id or '?'),
-    'Reason: ' .. tostring(ticket.reason or ''),
-  }
-  for index, request in ipairs(ticket.requests or {}) do
-    lines[#lines + 1] = ''
-    lines[#lines + 1] = ('Step %d: %s %s'):format(
-      index - 1, tostring(request.method or '?'), tostring(request.path or '?'))
-    if request.body == nil then
-      lines[#lines + 1] = 'Body: <none>'
-    else
-      lines[#lines + 1] = 'Body:'
-      vim.list_extend(lines, vim.split(M.pretty_json(request.body), '\n', { plain = true }))
-    end
-  end
-  return table.concat(lines, '\n')
+--- The typed-confirmation prompt.
+---
+--- The contract requires the operator to type the digest's final eight
+--- characters. A single keypress bound to "approve" does not satisfy it, and
+--- neither does a yes/no prompt.
+function M.confirm_prompt(ticket, action)
+  local digest = tostring(ticket.ticket_sha256 or '')
+  local suffix = digest:sub(-8)
+  return ('ticket_sha256: %s\nType the final digest bytes %s to %s: '):format(
+    digest, suffix, action)
+end
+
+function M.digest_suffix(ticket)
+  return tostring(ticket.ticket_sha256 or ''):sub(-8)
 end
 
 return M

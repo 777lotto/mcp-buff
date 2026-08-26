@@ -1,12 +1,25 @@
 local api, fn, uv = vim.api, vim.fn, (vim.uv or vim.loop)
 local client_module = require('mcp_buff.client')
+local capability = require('mcp_buff.capability')
+local canonical = require('mcp_buff.canonical')
 local render = require('mcp_buff.render')
 
 local DEFAULT_CONFIG = {
   endpoint = 'http://127.0.0.1:8792',
   curl_command = 'curl',
-  timeout = 300000,
+  -- Reads perform no execution, so they keep a short budget. A read that hangs
+  -- for half an hour is a broken tunnel, not a long approval.
+  timeout = 30000,
+  -- Approval executes every preflight and every mutation inside the POST, so
+  -- its budget is sized against that execution window rather than against a
+  -- conventional HTTP timeout. Neither of these bounds the operator's review
+  -- time, which is bounded only by ticket expiry.
+  decision_timeout = 1865,
+  poll_deadline = 1865,
   refresh_interval = 0,
+  capability_cmd = nil,
+  capability_ttl = capability.DEFAULT_TTL_SECONDS,
+  host_header = nil,
 }
 
 local M = {
@@ -41,6 +54,7 @@ local function define_highlights()
   link('McpBuffExecuting', 'DiagnosticInfo')
   link('McpBuffExecuted', 'DiagnosticOk')
   link('McpBuffFailed', 'DiagnosticError')
+  link('McpBuffIndeterminate', 'WarningMsg')
   link('McpBuffDenied', 'Comment')
   link('McpBuffExpired', 'DiagnosticDeprecated')
 end
@@ -98,6 +112,7 @@ local function summary_from_ticket(ticket)
     created = ticket.created,
     expires = ticket.expires,
     status = ticket.status,
+    ticket_sha256 = ticket.ticket_sha256,
     reason = ticket.reason,
     request_count = #(ticket.requests or {}),
     result_count = #(ticket.results or {}),
@@ -127,6 +142,7 @@ local function show_detail(ticket)
   api.nvim_set_option_value('buftype', 'nofile', { buf = buf })
   api.nvim_set_option_value('bufhidden', 'wipe', { buf = buf })
   api.nvim_set_option_value('swapfile', false, { buf = buf })
+  api.nvim_set_option_value('undofile', false, { buf = buf })
   api.nvim_set_option_value('modifiable', false, { buf = buf })
   api.nvim_set_option_value('filetype', 'markdown', { buf = buf })
   pcall(api.nvim_buf_set_name, buf, 'mcpbuff://ticket/' .. tostring(ticket.id))
@@ -187,7 +203,9 @@ function M.refresh(opts)
   request_generation = request_generation + 1
   local generation = request_generation
   rerender()
-  client:list(nil, function(err, tickets)
+  client:list(nil, {
+    allow_capability_fetch = opts.allow_capability_fetch,
+  }, function(err, tickets)
     if generation ~= request_generation then return end
     loading = false
     if err then
@@ -208,53 +226,99 @@ function M.primary()
   fetch_current(function(ticket) show_detail(ticket) end)
 end
 
-function M.approve()
-  fetch_current(function(ticket)
-    if ticket.status ~= 'pending' then
-      vim.notify('McpBuff: only pending tickets can be approved', vim.log.levels.WARN)
-      return
-    end
-    local choice = fn.confirm(render.approval(ticket), '&Cancel\n&Approve', 1)
-    if choice ~= 2 then return end
-    vim.notify('McpBuff: executing ' .. ticket.id .. '…', vim.log.levels.INFO)
-    client:approve(ticket.id, function(err, executed)
+-- Typed confirmation of the digest's final eight characters. A yes/no prompt
+-- does not satisfy the contract, so this deliberately has no default answer and
+-- no single-keypress path.
+local function typed_confirmation(ticket, action)
+  fn.inputsave()
+  local ok, answer = pcall(fn.input, render.confirm_prompt(ticket, action))
+  fn.inputrestore()
+  vim.cmd('redraw')
+  if not ok then return false end
+  return trim(answer) == render.digest_suffix(ticket)
+end
+
+local function report_decision(action, decided, info)
+  upsert_ticket(decided)
+  show_detail(decided)
+  local level = vim.log.levels.WARN
+  if decided.status == 'executed' or decided.status == 'denied' then
+    level = vim.log.levels.INFO
+  elseif decided.status == 'indeterminate' then
+    level = vim.log.levels.ERROR
+  end
+  local suffix = info and info.polled and ' (resolved by polling; the decision was not resent)' or ''
+  vim.notify(('McpBuff: %s → ticket %s%s'):format(action, tostring(decided.status), suffix), level)
+  if decided.status == 'indeterminate' then
+    vim.notify('McpBuff: this outcome is unknown, not failed. Inspect it upstream '
+      .. 'and never replay this ticket.', vim.log.levels.ERROR)
+  end
+end
+
+local function submit_decision(ticket, action, note)
+  if not typed_confirmation(ticket, action) then
+    vim.notify(('McpBuff: %s cancelled; the typed digest did not match'):format(action),
+      vim.log.levels.WARN)
+    return
+  end
+  vim.notify(('McpBuff: submitting %s for %s…'):format(action, ticket.id), vim.log.levels.INFO)
+  client:decide(ticket.id, action, {
+    ticket_sha256 = ticket.ticket_sha256,
+    note = note,
+  }, {
+    on_progress = function(message)
+      vim.notify('McpBuff: ' .. message, vim.log.levels.INFO)
+    end,
+    callback = function(err, decided, info)
       if err then
-        vim.notify('McpBuff: approval failed\n' .. err.message, vim.log.levels.ERROR)
+        vim.notify(('McpBuff: %s — %s'):format(action, err.message), vim.log.levels.ERROR)
         M.refresh({ silent = true })
         return
       end
-      upsert_ticket(executed)
-      show_detail(executed)
-      local level = executed.status == 'executed' and vim.log.levels.INFO or vim.log.levels.ERROR
-      vim.notify('McpBuff: ticket ' .. executed.status, level)
-    end)
+      report_decision(action, decided, info)
+    end,
+  })
+end
+
+-- Both decisions take the same route: a fresh read, a pending check, a local
+-- digest recomputation, a full render, then a typed confirmation.
+local function decide(action)
+  fetch_current(function(ticket)
+    if ticket.status ~= 'pending' then
+      vim.notify(('McpBuff: ticket is %s, not pending'):format(tostring(ticket.status)),
+        vim.log.levels.WARN)
+      return
+    end
+
+    -- Recomputing the digest guards a cross-ticket replay, a client-side digest
+    -- bug, and direct tampering with the stored ticket. It does not detect a
+    -- concurrent decision; the state machine does that.
+    local verified, reason = canonical.verify(ticket)
+    if not verified then
+      vim.notify('McpBuff: refusing to submit — ' .. reason, vim.log.levels.ERROR)
+      return
+    end
+
+    show_detail(ticket)
+
+    if action == 'deny' then
+      vim.ui.input({ prompt = 'Denial note (optional; Esc cancels): ' }, function(note)
+        if note == nil then return end
+        note = trim(note)
+        submit_decision(ticket, action, note ~= '' and note or nil)
+      end)
+    else
+      submit_decision(ticket, action, nil)
+    end
   end)
 end
 
+function M.approve()
+  decide('approve')
+end
+
 function M.deny()
-  fetch_current(function(ticket)
-    if ticket.status ~= 'pending' then
-      vim.notify('McpBuff: only pending tickets can be denied', vim.log.levels.WARN)
-      return
-    end
-    vim.ui.input({ prompt = 'Denial note (optional; Esc cancels): ' }, function(note)
-      if note == nil then return end
-      note = trim(note)
-      local message = 'Deny ticket ' .. ticket.id .. '?'
-      if note ~= '' then message = message .. '\n\nNote: ' .. note end
-      if fn.confirm(message, '&Cancel\n&Deny', 1) ~= 2 then return end
-      client:deny(ticket.id, note ~= '' and note or nil, function(err, denied)
-        if err then
-          vim.notify('McpBuff: denial failed\n' .. err.message, vim.log.levels.ERROR)
-          M.refresh({ silent = true })
-          return
-        end
-        upsert_ticket(denied)
-        show_detail(denied)
-        vim.notify('McpBuff: ticket denied', vim.log.levels.INFO)
-      end)
-    end)
-  end)
+  decide('deny')
 end
 
 function M.pending_count()
@@ -262,6 +326,7 @@ function M.pending_count()
 end
 
 function M.close()
+  capability.clear()
   local window = find_window()
   if not window then return end
   local last_window = #api.nvim_tabpage_list_wins(api.nvim_win_get_tabpage(window)) == 1
@@ -299,6 +364,7 @@ local function ensure_buffer()
   api.nvim_set_option_value('buftype', 'nofile', { buf = M.buf })
   api.nvim_set_option_value('bufhidden', 'hide', { buf = M.buf })
   api.nvim_set_option_value('swapfile', false, { buf = M.buf })
+  api.nvim_set_option_value('undofile', false, { buf = M.buf })
   api.nvim_set_option_value('buflisted', false, { buf = M.buf })
   api.nvim_set_option_value('modifiable', false, { buf = M.buf })
   api.nvim_set_option_value('filetype', 'mcpbuff', { buf = M.buf })
@@ -340,7 +406,10 @@ local function configure_timer()
   if seconds <= 0 then return end
   timer = uv.new_timer()
   timer:start(seconds * 1000, seconds * 1000, vim.schedule_wrap(function()
-    M.refresh({ silent = true })
+    -- allow_capability_fetch = false makes a credential prompt structurally
+    -- impossible on a timer tick: a cold or expired cache skips the tick
+    -- instead of running capability_cmd in the background.
+    M.refresh({ silent = true, allow_capability_fetch = false })
   end))
 end
 
@@ -353,6 +422,10 @@ function M.setup(opts)
   if not endpoint then error('mcp_buff.setup(): ' .. endpoint_error) end
   config.endpoint = endpoint
   config.timeout = math.max(1000, math.floor(tonumber(config.timeout) or DEFAULT_CONFIG.timeout))
+  config.decision_timeout = client_module.clamp_decision_seconds(
+    config.decision_timeout, DEFAULT_CONFIG.decision_timeout)
+  config.poll_deadline = client_module.clamp_decision_seconds(
+    config.poll_deadline, DEFAULT_CONFIG.poll_deadline)
   config.refresh_interval = math.floor(
     tonumber(config.refresh_interval) or DEFAULT_CONFIG.refresh_interval)
   if config.refresh_interval < 0 then
@@ -361,7 +434,32 @@ function M.setup(opts)
   if type(config.curl_command) ~= 'string' or trim(config.curl_command) == '' then
     error('mcp_buff.setup(): curl_command must be a non-empty string')
   end
+
+  -- The broker compares the request Host against its own bound socket port, so
+  -- an asymmetric forward is rejected. Overriding Host is the alternative to
+  -- making the forward symmetric.
+  if config.host_header ~= nil then
+    if type(config.host_header) ~= 'string'
+      or config.host_header:match('^127%.0%.0%.1:%d+$') == nil then
+      error('mcp_buff.setup(): host_header must look like 127.0.0.1:PORT')
+    end
+  end
+
+  local capability_cmd, capability_error = capability.normalize_cmd(config.capability_cmd)
+  if capability_error then error('mcp_buff.setup(): ' .. capability_error) end
+  config.capability_cmd = capability_cmd
+  config.capability_ttl = math.floor(tonumber(config.capability_ttl)
+    or DEFAULT_CONFIG.capability_ttl)
+  if config.capability_ttl < 0 then
+    error('mcp_buff.setup(): capability_ttl must be zero or a positive number')
+  end
+
   M.config = config
+  -- Reconfiguring drops any capability held for the previous configuration.
+  capability.configure({
+    cmd = capability_cmd,
+    ttl = config.capability_ttl,
+  })
   client = client_module.new(config)
   request_generation = request_generation + 1
   loading = false
@@ -381,6 +479,7 @@ api.nvim_create_autocmd('VimLeavePre', {
   group = api.nvim_create_augroup('McpBuffLifecycle', { clear = true }),
   callback = function()
     if timer then timer:stop(); timer:close(); timer = nil end
+    capability.clear()
   end,
 })
 
