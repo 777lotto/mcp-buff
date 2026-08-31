@@ -4,6 +4,23 @@ Notable changes are recorded here. Releases follow semantic versioning.
 
 ## Unreleased
 
+### Added
+
+- Optional `tunnel` configuration for a panel-scoped, loopback-only SSH
+  forward. McpBuff launches SSH without a shell, waits for its listener before
+  reading the admin capability, refuses an already occupied local port, and
+  terminates only the process it created.
+- Focused lifecycle tests for forward construction, concurrent startup,
+  occupied-port refusal, bounded failure, explicit teardown, and unexpected
+  SSH exit.
+
+### Changed
+
+- Closing or hiding the panel now clears the capability and stops a managed
+  tunnel. An in-flight approve or deny retains the route until outcome
+  resolution completes; background refresh never reopens a closed managed
+  route.
+
 ## 2.0.0
 
 Rebuilt against the hardened `mcp-broker` admin contract. This is a breaking
