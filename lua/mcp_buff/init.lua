@@ -3,6 +3,7 @@ local client_module = require('mcp_buff.client')
 local capability = require('mcp_buff.capability')
 local canonical = require('mcp_buff.canonical')
 local render = require('mcp_buff.render')
+local tunnel_module = require('mcp_buff.tunnel')
 
 local DEFAULT_CONFIG = {
   endpoint = 'http://127.0.0.1:8792',
@@ -20,6 +21,7 @@ local DEFAULT_CONFIG = {
   capability_cmd = nil,
   capability_ttl = capability.DEFAULT_TTL_SECONDS,
   host_header = nil,
+  tunnel = false,
 }
 
 local M = {
@@ -32,12 +34,16 @@ local M = {
 
 local PANEL_WIDTH = 92
 local namespace = api.nvim_create_namespace('mcp-buff')
+local lifecycle_group = api.nvim_create_augroup('McpBuffLifecycle', { clear = true })
 local request_generation = 0
 local loading = false
 local last_error
 local pending = 0
 local timer
 local client
+local tunnel
+local decision_active = false
+local end_session
 
 local function trim(value)
   return (value or ''):match('^%s*(.-)%s*$')
@@ -179,19 +185,33 @@ local function current_ticket()
   return item and item.kind == 'ticket' and item.ticket or nil
 end
 
+local function ensure_transport(callback)
+  if not tunnel then
+    callback(nil)
+    return
+  end
+  tunnel:ensure(callback)
+end
+
 local function fetch_current(callback)
   local summary = current_ticket()
   if not summary then
     vim.notify('McpBuff: move the cursor onto a ticket', vim.log.levels.INFO)
     return
   end
-  client:get(summary.id, function(err, ticket)
-    if err then
-      vim.notify('McpBuff: ' .. err.message, vim.log.levels.ERROR)
+  ensure_transport(function(transport_error)
+    if transport_error then
+      vim.notify('McpBuff: ' .. transport_error.message, vim.log.levels.ERROR)
       return
     end
-    upsert_ticket(ticket)
-    callback(ticket)
+    client:get(summary.id, function(err, ticket)
+      if err then
+        vim.notify('McpBuff: ' .. err.message, vim.log.levels.ERROR)
+        return
+      end
+      upsert_ticket(ticket)
+      callback(ticket)
+    end)
   end)
 end
 
@@ -203,22 +223,34 @@ function M.refresh(opts)
   request_generation = request_generation + 1
   local generation = request_generation
   rerender()
-  client:list(nil, {
-    allow_capability_fetch = opts.allow_capability_fetch,
-  }, function(err, tickets)
+  ensure_transport(function(transport_error)
     if generation ~= request_generation then return end
-    loading = false
-    if err then
-      last_error = err.message
+    if transport_error then
+      loading = false
+      last_error = transport_error.message
       if not opts.silent then
-        vim.notify('McpBuff: ' .. err.message, vim.log.levels.ERROR)
+        vim.notify('McpBuff: ' .. transport_error.message, vim.log.levels.ERROR)
       end
-    else
-      M.tickets = tickets or {}
-      last_error = nil
-      update_pending()
+      rerender()
+      return
     end
-    rerender()
+    client:list(nil, {
+      allow_capability_fetch = opts.allow_capability_fetch,
+    }, function(err, tickets)
+      if generation ~= request_generation then return end
+      loading = false
+      if err then
+        last_error = err.message
+        if not opts.silent then
+          vim.notify('McpBuff: ' .. err.message, vim.log.levels.ERROR)
+        end
+      else
+        M.tickets = tickets or {}
+        last_error = nil
+        update_pending()
+      end
+      rerender()
+    end)
   end)
 end
 
@@ -238,9 +270,9 @@ local function typed_confirmation(ticket, action)
   return trim(answer) == render.digest_suffix(ticket)
 end
 
-local function report_decision(action, decided, info)
+local function report_decision(action, decided, info, show)
   upsert_ticket(decided)
-  show_detail(decided)
+  if show ~= false then show_detail(decided) end
   local level = vim.log.levels.WARN
   if decided.status == 'executed' or decided.status == 'denied' then
     level = vim.log.levels.INFO
@@ -256,33 +288,60 @@ local function report_decision(action, decided, info)
 end
 
 local function submit_decision(ticket, action, note)
+  if decision_active then
+    vim.notify('McpBuff: a decision is already in progress', vim.log.levels.WARN)
+    return
+  end
   if not typed_confirmation(ticket, action) then
     vim.notify(('McpBuff: %s cancelled; the typed digest did not match'):format(action),
       vim.log.levels.WARN)
     return
   end
-  vim.notify(('McpBuff: submitting %s for %s…'):format(action, ticket.id), vim.log.levels.INFO)
-  client:decide(ticket.id, action, {
-    ticket_sha256 = ticket.ticket_sha256,
-    note = note,
-  }, {
-    on_progress = function(message)
-      vim.notify('McpBuff: ' .. message, vim.log.levels.INFO)
-    end,
-    callback = function(err, decided, info)
-      if err then
-        vim.notify(('McpBuff: %s — %s'):format(action, err.message), vim.log.levels.ERROR)
-        M.refresh({ silent = true })
-        return
-      end
-      report_decision(action, decided, info)
-    end,
-  })
+  ensure_transport(function(transport_error)
+    if transport_error then
+      vim.notify('McpBuff: ' .. transport_error.message, vim.log.levels.ERROR)
+      return
+    end
+    if decision_active then
+      vim.notify('McpBuff: a decision is already in progress', vim.log.levels.WARN)
+      return
+    end
+    decision_active = true
+    vim.notify(('McpBuff: submitting %s for %s…'):format(action, ticket.id),
+      vim.log.levels.INFO)
+    client:decide(ticket.id, action, {
+      ticket_sha256 = ticket.ticket_sha256,
+      note = note,
+    }, {
+      on_progress = function(message)
+        vim.notify('McpBuff: ' .. message, vim.log.levels.INFO)
+      end,
+      callback = function(err, decided, info)
+        decision_active = false
+        local visible = find_window() ~= nil
+        if err then
+          vim.notify(('McpBuff: %s — %s'):format(action, err.message), vim.log.levels.ERROR)
+          if visible then
+            M.refresh({ silent = true })
+          else
+            end_session()
+          end
+          return
+        end
+        report_decision(action, decided, info, visible)
+        if not visible then end_session() end
+      end,
+    })
+  end)
 end
 
 -- Both decisions take the same route: a fresh read, a pending check, a local
 -- digest recomputation, a full render, then a typed confirmation.
 local function decide(action)
+  if decision_active then
+    vim.notify('McpBuff: a decision is already in progress', vim.log.levels.WARN)
+    return
+  end
   fetch_current(function(ticket)
     if ticket.status ~= 'pending' then
       vim.notify(('McpBuff: ticket is %s, not pending'):format(tostring(ticket.status)),
@@ -325,19 +384,34 @@ function M.pending_count()
   return pending
 end
 
-function M.close()
+end_session = function(force)
+  if decision_active and not force then return false end
+  request_generation = request_generation + 1
+  loading = false
   capability.clear()
+  if tunnel then tunnel:stop() end
+  return true
+end
+
+function M.close()
+  local deferred = decision_active
   local window = find_window()
-  if not window then return end
-  local last_window = #api.nvim_tabpage_list_wins(api.nvim_win_get_tabpage(window)) == 1
-  local last_tab = fn.tabpagenr('$') == 1
-  if last_window and last_tab then
-    api.nvim_set_current_win(window)
-    vim.cmd('enew')
-  else
-    pcall(api.nvim_win_close, window, true)
+  if window then
+    local last_window = #api.nvim_tabpage_list_wins(api.nvim_win_get_tabpage(window)) == 1
+    local last_tab = fn.tabpagenr('$') == 1
+    if last_window and last_tab then
+      api.nvim_set_current_win(window)
+      vim.cmd('enew')
+    else
+      pcall(api.nvim_win_close, window, true)
+    end
   end
   M.win = nil
+  end_session()
+  if deferred then
+    vim.notify('McpBuff: review panel closed; the tunnel will close after the '
+      .. 'in-flight decision reaches an outcome', vim.log.levels.WARN)
+  end
 end
 
 function M.attach_keys()
@@ -369,6 +443,17 @@ local function ensure_buffer()
   api.nvim_set_option_value('modifiable', false, { buf = M.buf })
   api.nvim_set_option_value('filetype', 'mcpbuff', { buf = M.buf })
   pcall(api.nvim_buf_set_name, M.buf, 'mcpbuff://tickets')
+  api.nvim_create_autocmd({ 'BufHidden', 'BufWipeout' }, {
+    group = lifecycle_group,
+    buffer = M.buf,
+    callback = function()
+      -- :close and window-manager mappings do not call M.close(). Delay the
+      -- check until Neovim has removed the window, then revoke the session.
+      vim.schedule(function()
+        if not find_window() then end_session() end
+      end)
+    end,
+  })
   M.attach_keys()
   return M.buf
 end
@@ -406,6 +491,9 @@ local function configure_timer()
   if seconds <= 0 then return end
   timer = uv.new_timer()
   timer:start(seconds * 1000, seconds * 1000, vim.schedule_wrap(function()
+    -- Managed mode is attended and panel-scoped. A timer must never reopen the
+    -- SSH route after the operator closes the review surface.
+    if tunnel and not find_window() then return end
     -- allow_capability_fetch = false makes a credential prompt structurally
     -- impossible on a timer tick: a cold or expired cache skips the tick
     -- instead of running capability_cmd in the background.
@@ -416,6 +504,9 @@ end
 function M.setup(opts)
   if opts ~= nil and type(opts) ~= 'table' then
     error('mcp_buff.setup() expects a table')
+  end
+  if decision_active then
+    error('mcp_buff.setup(): cannot reconfigure while a decision is in progress')
   end
   local config = vim.tbl_deep_extend('force', vim.deepcopy(DEFAULT_CONFIG), opts or {})
   local endpoint, endpoint_error = client_module.normalize_endpoint(config.endpoint)
@@ -453,7 +544,13 @@ function M.setup(opts)
   if config.capability_ttl < 0 then
     error('mcp_buff.setup(): capability_ttl must be zero or a positive number')
   end
+  local tunnel_config, tunnel_error = tunnel_module.normalize(config.tunnel, config.endpoint)
+  if tunnel_error then error('mcp_buff.setup(): ' .. tunnel_error) end
+  config.tunnel = tunnel_config or false
 
+  request_generation = request_generation + 1
+  loading = false
+  if tunnel then tunnel:stop() end
   M.config = config
   -- Reconfiguring drops any capability held for the previous configuration.
   capability.configure({
@@ -461,11 +558,25 @@ function M.setup(opts)
     ttl = config.capability_ttl,
   })
   client = client_module.new(config)
-  request_generation = request_generation + 1
-  loading = false
+  if tunnel_config then
+    tunnel = tunnel_module.new(tunnel_config, {
+      on_exit = function(err)
+        capability.clear()
+        last_error = err.message
+        if find_window() then
+          rerender()
+          vim.notify('McpBuff: ' .. err.message, vim.log.levels.ERROR)
+        end
+      end,
+    })
+  else
+    tunnel = nil
+  end
   last_error = nil
   configure_timer()
-  if M.buf and api.nvim_buf_is_valid(M.buf) then M.refresh() end
+  if M.buf and api.nvim_buf_is_valid(M.buf) and (not tunnel or find_window()) then
+    M.refresh()
+  end
   return M
 end
 
@@ -476,10 +587,10 @@ api.nvim_create_autocmd('ColorScheme', {
   callback = define_highlights,
 })
 api.nvim_create_autocmd('VimLeavePre', {
-  group = api.nvim_create_augroup('McpBuffLifecycle', { clear = true }),
+  group = lifecycle_group,
   callback = function()
     if timer then timer:stop(); timer:close(); timer = nil end
-    capability.clear()
+    end_session(true)
   end,
 })
 

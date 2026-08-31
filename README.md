@@ -32,7 +32,8 @@ SSH.
 
 - Neovim 0.10 or newer
 - `curl` available on `PATH`
-- an SSH tunnel to an installed `mcp-broker` admin listener
+- SSH access to an installed `mcp-broker` admin listener, or an existing local
+  forward to it
 - a command that prints the broker's admin capability, such as a `pass` entry
 
 The plugin deliberately accepts only endpoints in the form
@@ -54,6 +55,9 @@ With lazy.nvim, matching the `nvim-config` GitPanel pattern:
   opts = {
     endpoint = "http://127.0.0.1:8792",
     capability_cmd = { "pass", "show", "your/broker/admin-capability" },
+    tunnel = {
+      host = "your-broker-host",
+    },
   },
 }
 ```
@@ -68,10 +72,42 @@ git clone https://github.com/777lotto/mcp-buff \
 nvim --headless -c "helptags ALL" -c quit
 ```
 
-## Open the approval tunnel
+## Approval tunnel
 
-The broker admin API binds only to box loopback. Open this tunnel on the
-Toughbook before starting the panel:
+The broker admin API binds only to box loopback. McpBuff can own the local
+forward for the lifetime of the review panel:
+
+```lua
+tunnel = {
+  host = "your-broker-host", -- SSH alias or hostname
+  ssh_command = "ssh",
+  startup_timeout = 30000,   -- milliseconds
+}
+```
+
+With this option, opening `:McpBuff` launches one foreground SSH process with
+no shell:
+
+```text
+ssh -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -o ControlMaster=no -o ControlPath=none \
+  -L 127.0.0.1:8792:127.0.0.1:8792 your-broker-host
+```
+
+McpBuff waits for the listener before reading the capability or making an HTTP
+request. Closing the panel with `q`, `:close`, or a window-manager mapping
+terminates only that SSH child; `VimLeavePre` does the same. An in-flight
+approve or deny keeps the route until its outcome is resolved, even if the
+panel is hidden, and then closes it. McpBuff never starts, stops, or
+reconfigures an underlying VPN.
+
+Managed mode refuses to reuse an already occupied local port. That fail-closed
+rule prevents the capability from being sent through a process McpBuff did not
+create. Use a dedicated SSH alias without unrelated configured forwards.
+
+The default, `tunnel = false`, preserves external lifecycle management. In
+that mode, open the forward before starting the panel:
 
 ```sh
 ssh -N -L 8792:127.0.0.1:8792 you@your-broker-host
@@ -85,8 +121,8 @@ port — and is still rejected with `400`, because the client sends
 `Host: 127.0.0.1:9999` while the broker's bound port is `8792`. Either make the
 local forward port equal the broker's admin port, or set `host_header`.
 
-Keep that SSH process running. Stopping it revokes reachability. Never add `-g`
-or bind the local side to `0.0.0.0`.
+Keep an externally managed SSH process running while reviewing. Stopping it
+revokes reachability. Never add `-g` or bind the local side to `0.0.0.0`.
 
 ## The admin capability
 
@@ -103,10 +139,11 @@ or any message the plugin prints. It travels to curl through a configuration
 file fed on standard input.
 
 The value is held for `capability_ttl` seconds so that refreshing does not
-re-run the command for every request, and is dropped when the panel closes,
-when Neovim exits, and whenever `setup()` runs again. A `401` triggers exactly
-one forced re-read, in case the capability was rotated mid-session; after that
-the failure is surfaced rather than retried.
+re-run the command for every request, and is dropped when the review session
+closes, when Neovim exits, and whenever `setup()` runs again. An in-flight
+decision delays session teardown until its outcome resolves. A `401` triggers
+exactly one forced re-read, in case the capability was rotated mid-session;
+after that the failure is surfaced rather than retried.
 
 A failed capability read **aborts the request**. mcp-buff never falls back to
 an unauthenticated send, because that failure reaches you as an opaque `401`
@@ -129,11 +166,15 @@ require("mcp_buff").setup({
   poll_deadline = 1865,     -- seconds; outcome polling after a failed POST
   refresh_interval = 0,     -- seconds; 0 keeps automatic refresh off
   host_header = nil,        -- e.g. "127.0.0.1:8792" for an asymmetric forward
+  tunnel = false,           -- or { host = "broker-ssh-alias" }
 })
 ```
 
 `setup()` rejects remote, bridge, HTTPS, path-bearing, and credential-bearing
 endpoints. Curl ignores user configuration and does not follow redirects.
+When `tunnel` is enabled, `host` is required; `ssh_command` defaults to `ssh`,
+and `startup_timeout` accepts `1000..120000` milliseconds. Unknown tunnel keys
+are rejected.
 
 **The two timeouts are different budgets and are deliberately not shared.**
 `timeout` covers reads, which perform no execution — a read that hangs for half
@@ -149,7 +190,9 @@ expiry, which the detail view always shows.
 
 Set `refresh_interval` to a positive whole number to refresh in the background.
 Manual `r` remains available regardless. The default is intentionally off so
-merely installing the plugin creates no recurring network activity.
+merely installing the plugin creates no recurring network activity. In managed
+mode, timer ticks occur only while the panel is visible and never reopen a
+closed tunnel.
 
 ## Command and controls
 
@@ -163,7 +206,7 @@ Mappings are local to the panel buffer:
 | `a` | Re-fetch, review, type the digest confirmation, and approve |
 | `d` | Re-fetch, review, type the digest confirmation, and deny with an optional note |
 | `r` | Refresh the ticket list |
-| `q` | Close the panel |
+| `q` | Close the panel and its managed tunnel |
 
 `<NL>` and keypad Enter work like `<CR>`, matching terminal-safe GitPanel
 behavior. Detail windows close with `q` or `<Esc>`.
@@ -275,8 +318,9 @@ function()
 end
 ```
 
-Enable the optional timer if the statusline should stay current while the panel
-is closed.
+With an external tunnel, the optional timer can keep the statusline current
+while the panel is closed. Managed mode is intentionally panel-scoped, so its
+timer does not reopen the route after the review surface closes.
 
 ## Security boundary
 
@@ -292,7 +336,9 @@ Cloudflare API client, and no place to configure a read or write token.
   user, so do not type anything into a denial note you would not put in `ps`
   output;
 - curl user configuration and redirects are disabled, and no shell is involved
-  anywhere, including the capability fetch;
+  anywhere, including the capability fetch and managed SSH launch;
+- managed mode uses a symmetric loopback-only forward, disables SSH control
+  multiplexing for exact process ownership, and refuses an existing listener;
 - approve and deny operate only on a broker-shaped ticket ID and send only what
   the strict schemas allow;
 - approve and deny send only the digest of the ticket the broker already
@@ -305,8 +351,9 @@ Cloudflare API client, and no place to configure a read or write token.
 Never weaken the broker, expose its admin listener, or move the capability
 somewhere more convenient to restore compatibility with an older client.
 
-The SSH account remains the authority boundary. Close the tunnel when review is
-finished.
+The SSH account remains the authority boundary. Managed mode closes its route
+with the review session; external mode leaves that responsibility to the
+operator.
 
 ## Platform support
 
@@ -367,6 +414,7 @@ mcp-buff/
 ├── lua/mcp_buff/client.lua     # loopback curl admin client
 ├── lua/mcp_buff/canonical.lua  # canonical JSON and the ticket digest
 ├── lua/mcp_buff/capability.lua # in-memory admin capability acquisition
+├── lua/mcp_buff/tunnel.lua     # optional owned SSH-forward lifecycle
 ├── lua/mcp_buff/render.lua     # list, detail, confirmation, and JSON rendering
 ├── plugin/mcp-buff.lua         # lightweight command registration
 ├── doc/mcp-buff.txt            # :help mcp-buff

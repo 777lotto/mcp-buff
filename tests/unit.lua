@@ -2,6 +2,7 @@ local canonical = require('mcp_buff.canonical')
 local capability = require('mcp_buff.capability')
 local client = require('mcp_buff.client')
 local render = require('mcp_buff.render')
+local tunnel = require('mcp_buff.tunnel')
 
 local function equal(actual, expected, message)
   assert(actual == expected, (message or 'values differ') ..
@@ -18,6 +19,180 @@ end
 
 local function settle(predicate, message)
   assert(vim.wait(2000, predicate, 5), message or 'operation did not settle')
+end
+
+local function test_tunnel_configuration_and_argv()
+  equal(tunnel.normalize(false, 'http://127.0.0.1:8792'), nil)
+
+  local config = assert(tunnel.normalize({
+    host = 'zemrip-server',
+  }, 'http://127.0.0.1:8792'))
+  equal(config.host, 'zemrip-server')
+  equal(config.port, 8792)
+  equal(config.startup_timeout, tunnel.DEFAULT_STARTUP_TIMEOUT_MS)
+
+  local argv = tunnel.argv(config)
+  local command = table.concat(argv, ' ')
+  equal(argv[1], 'ssh')
+  equal(argv[#argv], 'zemrip-server')
+  contains(command, '-L 127.0.0.1:8792:127.0.0.1:8792')
+  contains(command, 'BatchMode=yes')
+  contains(command, 'ExitOnForwardFailure=yes')
+  contains(command, 'ControlMaster=no')
+  contains(command, 'ControlPath=none')
+  excludes(command, '0.0.0.0', 'the managed listener was exposed beyond loopback')
+  excludes(command, ' -g', 'ssh gateway forwarding was enabled')
+
+  assert(select(2, tunnel.normalize({ host = '-oProxyCommand=bad' },
+    'http://127.0.0.1:8792')) ~= nil, 'an ssh option was accepted as a host')
+  assert(select(2, tunnel.normalize({ host = 'host with spaces' },
+    'http://127.0.0.1:8792')) ~= nil, 'a command fragment was accepted as a host')
+  assert(select(2, tunnel.normalize({ host = 'safe', extra = true },
+    'http://127.0.0.1:8792')) ~= nil, 'an unknown tunnel option was ignored')
+  assert(select(2, tunnel.normalize({ host = 'safe', startup_timeout = 999 },
+    'http://127.0.0.1:8792')) ~= nil, 'an unsafe startup timeout was accepted')
+end
+
+local function tunnel_harness(probe_results, overrides)
+  local record = {
+    probes = 0,
+    spawns = {},
+    deferred = {},
+    kills = {},
+    exit_callback = nil,
+    unexpected = nil,
+  }
+  local probe_index = 0
+  local function probe(port, callback)
+    record.probes = record.probes + 1
+    equal(port, 8792)
+    probe_index = probe_index + 1
+    local result = probe_results[probe_index]
+    if result == nil then result = probe_results[#probe_results] end
+    if type(result) == 'table' then
+      callback(result.listening, result.error)
+    else
+      callback(result)
+    end
+  end
+  local function spawn(command, opts, callback)
+    local job = {
+      kill = function(_, signal)
+        record.kills[#record.kills + 1] = signal
+      end,
+    }
+    record.spawns[#record.spawns + 1] = {
+      command = command,
+      opts = opts,
+      job = job,
+    }
+    record.exit_callback = callback
+    return job
+  end
+
+  local config = assert(tunnel.normalize({
+    host = 'zemrip-server',
+    startup_timeout = overrides and overrides.startup_timeout or 30000,
+  }, 'http://127.0.0.1:8792'))
+  local manager = tunnel.new(config, {
+    probe = probe,
+    spawn = spawn,
+    executable = overrides and overrides.executable or function() return true end,
+    schedule = function(callback) callback() end,
+    defer = function(callback, ms)
+      record.deferred[#record.deferred + 1] = { callback = callback, ms = ms }
+    end,
+    on_exit = function(err) record.unexpected = err end,
+  })
+  record.run_next = function()
+    local deferred = table.remove(record.deferred, 1)
+    assert(deferred, 'no deferred tunnel callback is available')
+    deferred.callback()
+  end
+  return manager, record
+end
+
+local function test_tunnel_owned_lifecycle()
+  local manager, record = tunnel_harness({ false, true })
+  local callbacks = {}
+  manager:ensure(function(err) callbacks[#callbacks + 1] = err or true end)
+  manager:ensure(function(err) callbacks[#callbacks + 1] = err or true end)
+  equal(#record.spawns, 1, 'concurrent ensure calls spawned more than one ssh process')
+  equal(#callbacks, 0, 'the tunnel was reported ready before its listener opened')
+  equal(record.spawns[1].opts.text, true)
+
+  record.run_next()
+  equal(#callbacks, 2)
+  equal(callbacks[1], true)
+  assert(manager:is_ready())
+
+  manager:ensure(function(err) callbacks[#callbacks + 1] = err or true end)
+  equal(#record.spawns, 1)
+  equal(#callbacks, 3)
+
+  manager:stop()
+  equal(record.kills[1], 15, 'the owned ssh process was not terminated with SIGTERM')
+  assert(not manager:is_ready())
+  -- A late exit callback from the process just stopped is expected and silent.
+  record.exit_callback({ code = 143, signal = 15, stderr = '' })
+  equal(record.unexpected, nil)
+end
+
+local function test_tunnel_refuses_unowned_listener()
+  local manager, record = tunnel_harness({ true })
+  local failure
+  manager:ensure(function(err) failure = err end)
+  equal(failure.kind, 'tunnel')
+  contains(failure.message, 'already has a listener')
+  contains(failure.message, 'does not own')
+  equal(#record.spawns, 0, 'ssh was launched despite an occupied local port')
+  equal(#record.kills, 0, 'an unowned listener was terminated')
+end
+
+local function test_tunnel_failures_are_bounded()
+  local early, early_record = tunnel_harness({ false })
+  local early_failure
+  early:ensure(function(err) early_failure = err end)
+  early_record.exit_callback({
+    code = 255,
+    stderr = 'ssh: connect to host 10.24.0.1 port 22: Network is unreachable\n',
+  })
+  equal(early_failure.kind, 'tunnel')
+  contains(early_failure.message, 'Network is unreachable')
+  assert(not early:is_ready())
+
+  local timed, timed_record = tunnel_harness({ false }, { startup_timeout = 1000 })
+  local timeout_failure
+  timed:ensure(function(err) timeout_failure = err end)
+  local iterations = 0
+  while not timeout_failure and #timed_record.deferred > 0 do
+    timed_record.run_next()
+    iterations = iterations + 1
+    assert(iterations < 30, 'managed tunnel startup did not honor its timeout')
+  end
+  equal(timeout_failure.kind, 'tunnel')
+  contains(timeout_failure.message, 'within 1000 ms')
+  equal(timed_record.kills[1], 15, 'timed-out ssh process was left running')
+
+  local missing, missing_record = tunnel_harness({ false }, {
+    executable = function() return false end,
+  })
+  local missing_failure
+  missing:ensure(function(err) missing_failure = err end)
+  contains(missing_failure.message, 'SSH executable is not available')
+  equal(missing_record.probes, 0)
+  equal(#missing_record.spawns, 0)
+end
+
+local function test_tunnel_unexpected_exit_is_reported()
+  local manager, record = tunnel_harness({ false, true })
+  manager:ensure(function(err) assert(not err, vim.inspect(err)) end)
+  record.run_next()
+  record.exit_callback({ code = 255, stderr = 'client_loop: send disconnect: Broken pipe\n' })
+  equal(record.unexpected.kind, 'tunnel')
+  contains(record.unexpected.message, 'closed unexpectedly')
+  contains(record.unexpected.message, 'Broken pipe')
+  assert(not manager:is_ready())
 end
 
 local function test_endpoint_boundary()
@@ -681,6 +856,11 @@ end
 
 test_endpoint_boundary()
 test_ticket_id_boundary()
+test_tunnel_configuration_and_argv()
+test_tunnel_owned_lifecycle()
+test_tunnel_refuses_unowned_listener()
+test_tunnel_failures_are_bounded()
+test_tunnel_unexpected_exit_is_reported()
 test_canonical_broker_vectors()
 test_canonical_encoding_rules()
 test_canonical_fail_safe()
