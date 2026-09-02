@@ -2,6 +2,7 @@ local api, fn, uv = vim.api, vim.fn, (vim.uv or vim.loop)
 local client_module = require('mcp_buff.client')
 local capability = require('mcp_buff.capability')
 local canonical = require('mcp_buff.canonical')
+local permissions = require('mcp_buff.permissions')
 local render = require('mcp_buff.render')
 local tunnel_module = require('mcp_buff.tunnel')
 
@@ -22,6 +23,7 @@ local DEFAULT_CONFIG = {
   capability_ttl = capability.DEFAULT_TTL_SECONDS,
   host_header = nil,
   tunnel = false,
+  permissions = {},
 }
 
 local M = {
@@ -386,6 +388,7 @@ end
 
 end_session = function(force)
   if decision_active and not force then return false end
+  if permissions.uses_shared_session() and not force then return false end
   request_generation = request_generation + 1
   loading = false
   capability.clear()
@@ -548,6 +551,22 @@ function M.setup(opts)
   if tunnel_error then error('mcp_buff.setup(): ' .. tunnel_error) end
   config.tunnel = tunnel_config or false
 
+  permissions.configure(config.permissions, {
+    endpoint = config.endpoint,
+    curl_command = config.curl_command,
+    timeout = config.timeout,
+    capability_cmd = config.capability_cmd,
+    capability_ttl = config.capability_ttl,
+    host_header = config.host_header,
+    tunnel = config.tunnel,
+  }, {
+    capability = capability,
+    ensure_transport = ensure_transport,
+    release_transport = function()
+      if not find_window() then end_session() end
+    end,
+  })
+
   request_generation = request_generation + 1
   loading = false
   if tunnel then tunnel:stop() end
@@ -580,8 +599,19 @@ function M.setup(opts)
   return M
 end
 
+function M.open_permissions()
+  permissions.open()
+end
+
 define_highlights()
 client = client_module.new(M.config)
+permissions.configure(DEFAULT_CONFIG.permissions, DEFAULT_CONFIG, {
+  capability = capability,
+  ensure_transport = ensure_transport,
+  release_transport = function()
+    if not find_window() then end_session() end
+  end,
+})
 api.nvim_create_autocmd('ColorScheme', {
   group = api.nvim_create_augroup('McpBuffHighlights', { clear = true }),
   callback = define_highlights,

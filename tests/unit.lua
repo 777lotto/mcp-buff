@@ -854,6 +854,136 @@ local function test_capability_cache_and_prompt_containment()
   equal(select(1, capability.normalize_cmd({ 'pass', 'show', 'x' }))[2], 'show')
 end
 
+local function test_provider_capabilities_are_isolated()
+  local first_runs, second_runs = 0, 0
+  local first = capability.new({
+    cmd = { 'first-capability' },
+    ttl = 300,
+    spawn = function(_, _, callback)
+      first_runs = first_runs + 1
+      callback({ code = 0, stdout = string.rep('1a', 32) .. '\n', stderr = '' })
+      return {}
+    end,
+  })
+  local second = capability.new({
+    cmd = { 'second-capability' },
+    ttl = 300,
+    spawn = function(_, _, callback)
+      second_runs = second_runs + 1
+      callback({ code = 0, stdout = string.rep('2b', 32) .. '\n', stderr = '' })
+      return {}
+    end,
+  })
+
+  local first_value, second_value
+  first.get({}, function(err, value)
+    assert(not err, vim.inspect(err))
+    first_value = value
+  end)
+  second.get({}, function(err, value)
+    assert(not err, vim.inspect(err))
+    second_value = value
+  end)
+  settle(function() return first_value ~= nil and second_value ~= nil end)
+  excludes(first_value, second_value, 'two providers shared one capability value')
+  equal(first_runs, 1)
+  equal(second_runs, 1)
+
+  first.clear()
+  assert(second.cached(), 'clearing one provider cleared the other provider cache')
+  second.get({}, function() end)
+  equal(second_runs, 1, 'the other provider capability was re-read')
+end
+
+local function permission_snapshot(provider)
+  return {
+    provider = provider,
+    permissions_sha256 = string.rep('7', 64),
+    permissions = {
+      {
+        id = provider .. '.read',
+        title = 'Read',
+        description = 'Read through the broker.',
+        enabled = true,
+        ceiling = true,
+      },
+      {
+        id = provider .. '.write',
+        title = 'Write',
+        description = 'Write through the broker.',
+        enabled = false,
+        ceiling = true,
+      },
+    },
+  }
+end
+
+local function test_permissions_contract_and_provider_binding()
+  local current = permission_snapshot('github')
+  local fake = recorder(function(call)
+    if call.argv:find('--request POST', 1, true) then
+      local updated = vim.deepcopy(current)
+      updated.permissions_sha256 = string.rep('8', 64)
+      updated.permissions[1].enabled = false
+      return { code = 0, stdout = vim.json.encode(updated) .. '\n200', stderr = '' }
+    end
+    return { code = 0, stdout = vim.json.encode(current) .. '\n200', stderr = '' }
+  end)
+  local api = new_client(fake, fake_capability({}), { permission_provider = 'github' })
+
+  local fetched
+  api:get_permissions(function(err, snapshot)
+    assert(not err, vim.inspect(err))
+    fetched = snapshot
+  end)
+  equal(fetched.provider, 'github')
+  contains(fake.calls[1].argv, 'http://127.0.0.1:8792/permissions')
+
+  local updated
+  api:update_permissions(fetched, {}, function(err, snapshot)
+    assert(not err, vim.inspect(err))
+    updated = snapshot
+  end)
+  equal(updated.permissions_sha256, string.rep('8', 64))
+  local body = fake.calls[2].command[vim.tbl_contains(fake.calls[2].command, '--data-raw')
+      and vim.fn.index(fake.calls[2].command, '--data-raw') + 2 or 0]
+  local decoded = vim.json.decode(body)
+  equal(decoded.permissions_sha256, string.rep('7', 64))
+  equal(#decoded.enabled, 0)
+  equal(vim.tbl_count(decoded), 2, 'the strict update body gained an extra field')
+
+  local wrong = permission_snapshot('cloudflare')
+  local mismatch
+  api:update_permissions(wrong, {}, function(err) mismatch = err end)
+  equal(mismatch.kind, 'configuration')
+  equal(#fake.calls, 2, 'a snapshot from another provider reached the broker')
+
+  local duplicate
+  api:update_permissions(fetched, { 'github.read', 'github.read' }, function(err)
+    duplicate = err
+  end)
+  equal(duplicate.kind, 'configuration')
+  equal(#fake.calls, 2, 'duplicate enabled permissions reached the broker')
+end
+
+local function test_permissions_conflict_is_definitive()
+  local fake = recorder(function()
+    return {
+      code = 0,
+      stdout = '{"error":"permissions changed since they were read"}\n409',
+      stderr = '',
+    }
+  end)
+  local api = new_client(fake, fake_capability({}), { permission_provider = 'github' })
+  local failure
+  api:update_permissions(permission_snapshot('github'), { 'github.read' }, function(err)
+    failure = err
+  end)
+  equal(failure.kind, 'permissions_conflict')
+  equal(failure.definitive, true)
+  equal(#fake.calls, 1, 'a permission update conflict was retried')
+end
+
 test_endpoint_boundary()
 test_ticket_id_boundary()
 test_tunnel_configuration_and_argv()
@@ -881,5 +1011,8 @@ test_a_decision_is_never_resubmitted()
 test_definitive_refusals_are_not_polled()
 test_poll_deadline_reports_unknown_and_stops()
 test_capability_cache_and_prompt_containment()
+test_provider_capabilities_are_isolated()
+test_permissions_contract_and_provider_binding()
+test_permissions_conflict_is_definitive()
 
 print('McpBuff unit tests passed')

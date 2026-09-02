@@ -1,4 +1,4 @@
-*mcp-buff.txt* *mcp-buff*       Reviewed mcp-broker tickets in Neovim
+*mcp-buff.txt* *mcp-buff*       Broker review and permissions in Neovim
 
 ==============================================================================
 CONTENTS                                                     *mcp-buff-contents*
@@ -7,19 +7,20 @@ CONTENTS                                                     *mcp-buff-contents*
 2. Installation ......................................... |mcp-buff-installation|
 3. Tunnel ..................................................... |mcp-buff-tunnel|
 4. Capability ............................................. |mcp-buff-capability|
-5. Command and keys ......................................... |mcp-buff-commands|
-6. Review flow ................................................ |mcp-buff-review|
-7. Decision outcomes ........................................ |mcp-buff-outcomes|
-8. Configuration ............................................. |mcp-buff-config|
-9. Lua API ....................................................... |mcp-buff-api|
-10. Security ............................................... |mcp-buff-security|
-11. Development ......................................... |mcp-buff-development|
+5. Runtime permissions ................................... |mcp-buff-permissions|
+6. Command and keys ......................................... |mcp-buff-commands|
+7. Review flow ................................................ |mcp-buff-review|
+8. Decision outcomes ........................................ |mcp-buff-outcomes|
+9. Configuration ............................................. |mcp-buff-config|
+10. Lua API ...................................................... |mcp-buff-api|
+11. Security ............................................... |mcp-buff-security|
+12. Development ......................................... |mcp-buff-development|
 
 ==============================================================================
 1. REQUIREMENTS                                           *mcp-buff-requirements*
 
 Neovim 0.10 or newer, curl on $PATH, SSH access (or an existing local forward)
-to an installed mcp-broker admin listener, and a command that can print the
+to an installed broker admin listener, and a command that can print each
 broker's admin capability. McpBuff has no Lua or Neovim plugin dependencies.
 
 It never accepts a Cloudflare token and never calls Cloudflare directly.
@@ -36,15 +37,25 @@ With lazy.nvim: >lua
     {
       "777lotto/mcp-buff",
       main = "mcp_buff",
-      cmd = { "McpBuff" },
+      cmd = { "McpBuff", "McpBuffPermissions" },
       keys = {
         { "<leader>mb", "<cmd>McpBuff<cr>",
           desc = "Cloudflare write tickets" },
+        { "<leader>mp", "<cmd>McpBuffPermissions<cr>",
+          desc = "Broker permissions" },
       },
       opts = {
         endpoint = "http://127.0.0.1:8792",
         capability_cmd = { "pass", "show", "your/broker/admin-capability" },
         tunnel = { host = "your-broker-host" },
+        permissions = {
+          github = {
+            capability_cmd = {
+              "pass", "show", "your/github/admin-capability"
+            },
+            tunnel = { host = "your-broker-host" },
+          },
+        },
       },
     }
 <
@@ -128,9 +139,47 @@ credential prompt storm structurally impossible rather than merely unlikely.
 Press r when you want the panel to acquire a capability again.
 
 ==============================================================================
-5. COMMAND AND KEYS                                          *mcp-buff-commands*
+5. RUNTIME PERMISSIONS                                    *mcp-buff-permissions*
+
+:McpBuffPermissions opens effective runtime switches for the Cloudflare and
+GitHub brokers. These switches can only narrow the compiled, reviewed broker
+policy. They cannot add an operation, change a route, edit a credential,
+alter GitHub App permissions, or expand a Cloudflare API token.
+
+Cloudflare entries correspond one-for-one with compiled mutation operation
+IDs. GitHub groups cover MCP, Git read, agent-branch push, reviewed workflow
+push, API reads, issue writes, pull-request writes, and gated merge.
+
+Space or Enter toggles a row. Press a to apply the selected provider after
+typing the final eight characters of its current state digest. The complete
+digest is sent with the desired subset, so a concurrent change answers 409
+and must be refreshed. An unaccounted-for POST is never retried; the panel
+marks the state unknown and requires a fresh read.
+
+Cloudflare permissions share the main Cloudflare capability and managed
+tunnel. GitHub defaults to http://127.0.0.1:8793 and uses a distinct
+capability cache and optional tunnel: >lua
+
+    permissions = {
+      cloudflare = {},
+      github = {
+        capability_cmd = {
+          "pass", "show", "your/github/admin-capability"
+        },
+        tunnel = { host = "your-broker-host" },
+      },
+    }
+<
+Set either provider to false to hide it. GitHub remains visibly unconfigured
+until its capability_cmd is supplied. Broker releases without GET /permissions
+and POST /permissions must be upgraded; do not weaken the admin boundary.
+
+==============================================================================
+6. COMMAND AND KEYS                                          *mcp-buff-commands*
 
 :McpBuff        Open the ticket panel as a left split.
+:McpBuffPermissions
+                Open the provider runtime-permissions panel as a left split.
 
 The following mappings are local to the panel buffer:
 
@@ -144,8 +193,13 @@ r               Refresh the ticket list.
 q               Close the panel and its managed tunnel. In detail, q or <Esc>
                 closes the float.
 
+In the permissions panel, Space or Enter toggles a permission, a applies the
+selected provider after typed digest confirmation, r refreshes both providers,
+and q closes the panel. An in-flight update retains its owned route until the
+outcome is accounted for.
+
 ==============================================================================
-6. REVIEW FLOW                                                 *mcp-buff-review*
+7. REVIEW FLOW                                                 *mcp-buff-review*
 
 The panel groups tickets pending-first, followed by approved, executing,
 indeterminate, failed, denied, expired, and executed. Rows show age, the
@@ -194,7 +248,7 @@ the exact suffix cancels, and nothing is sent.
 The plugin cannot edit a ticket and supplies no requests at approval time.
 
 ==============================================================================
-7. DECISION OUTCOMES                                         *mcp-buff-outcomes*
+8. DECISION OUTCOMES                                         *mcp-buff-outcomes*
 
 A decision is never resubmitted.                       *mcp-buff-no-resubmit*
 
@@ -254,7 +308,7 @@ and then 404s. Listing tickets is what expires the overdue and prunes the
 aged, so the list itself is not a pure read.
 
 ==============================================================================
-8. CONFIGURATION                                             *mcp-buff-config*
+9. CONFIGURATION                                             *mcp-buff-config*
 
 Default configuration: >lua
 
@@ -269,6 +323,14 @@ Default configuration: >lua
       refresh_interval = 0,     -- seconds; automatic refresh is off
       host_header = nil,        -- e.g. "127.0.0.1:8792" for an asymmetric forward
       tunnel = false,           -- or { host = "broker-ssh-alias" }
+      permissions = {
+        cloudflare = {},        -- inherits the main Cloudflare session
+        github = {
+          endpoint = "http://127.0.0.1:8793",
+          capability_cmd = nil, -- distinct GitHub admin capability
+          tunnel = false,
+        },
+      },
     })
 <
 endpoint must use the exact shape http://127.0.0.1:PORT. Remote, bridge,
@@ -304,14 +366,23 @@ must be an SSH alias or hostname without whitespace. ssh_command defaults to
 1000..120000. Unknown keys are rejected. The endpoint port supplies both sides
 of the symmetric loopback forward.
 
+permissions.cloudflare is {} by default and inherits the main Cloudflare
+endpoint, capability, and tunnel. It may be false to hide that provider.
+
+permissions.github defaults to endpoint http://127.0.0.1:8793 and has no
+capability_cmd or tunnel. Supply its own capability_cmd and, when desired, its
+own managed tunnel. It may be false to hide GitHub. The two provider
+capabilities are never shared.
+
 ==============================================================================
-9. LUA API                                                         *mcp-buff-api*
+10. LUA API                                                        *mcp-buff-api*
 
 The module is returned by: >lua
 
     local buff = require("mcp_buff")
     buff.setup({ capability_cmd = { "pass", "show", "entry" } })
     buff.open()
+    buff.open_permissions()
     buff.refresh()
     buff.pending_count()
     buff.close()
@@ -320,7 +391,7 @@ pending_count() is nonblocking and returns the latest cached count. It returns
 0 before the first successful refresh. This makes it safe for statuslines.
 
 ==============================================================================
-10. SECURITY                                                  *mcp-buff-security*
+11. SECURITY                                                  *mcp-buff-security*
 
 McpBuff speaks only the loopback broker admin API through curl. Curl user
 configuration and redirects are disabled, the endpoint is syntactically
@@ -338,10 +409,12 @@ Panel and detail buffers are nofile with swap files and undo files disabled,
 so ticket bodies and Cloudflare responses do not reach swap, undo, or log
 files. The plugin persists nothing.
 
-McpBuff has no Cloudflare API client, no zemRip dependency, and nowhere to
-configure a read or write token. Never weaken the broker, expose its admin
-listener, or move the capability somewhere more convenient in order to restore
-compatibility with an older client.
+McpBuff has no GitHub or Cloudflare API client, no zemRip dependency, and
+nowhere to configure a provider token. Permission updates contain only the
+current state digest and a subset of IDs advertised by that same provider;
+GitHub and Cloudflare capabilities remain in isolated caches. Never weaken a
+broker, expose its admin listener, or move a capability somewhere more
+convenient in order to restore compatibility with an older client.
 
 Managed mode creates a symmetric loopback-only forward, disables SSH control
 multiplexing for exact process ownership, and refuses to reuse an existing
@@ -350,15 +423,15 @@ Managed mode closes its route with the review session; external mode leaves
 that responsibility to the operator.
 
 ==============================================================================
-11. DEVELOPMENT                                            *mcp-buff-development*
+12. DEVELOPMENT                                            *mcp-buff-development*
 
 Linux is tested on Neovim 0.10, 0.11, and 0.12. macOS is smoke-tested on
 Neovim 0.12. The dependency-free Node stub in scripts/stub-admin-server.js
 implements the hardened admin contract — the four gates in order, strict
-decision schemas, digest binding, synchronous terminal approval, lazy expiry,
-retention pruning, HTML off-route bodies, and the 32kb-to-500 behaviour — so
-the headless suite exercises the real contract over real curl. No test reaches
-a broker host or Cloudflare.
+decision and permission schemas, digest binding, synchronous terminal
+approval, lazy expiry, retention pruning, HTML off-route bodies, and the
+32kb-to-500 behaviour — so the headless suite exercises the real contract over
+real curl. No test reaches a broker host or provider.
 
 The canonical JSON test vectors are copied verbatim from the broker's own
 suite. If the two implementations ever disagree, the unit tests fail before

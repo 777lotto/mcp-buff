@@ -215,6 +215,65 @@ for (const ticket of seed) {
 let ticketListRequests = 0;
 // Counted so the suite can prove a decision is submitted exactly once.
 let decisionPosts = 0;
+let permissionPosts = 0;
+
+const permissionDefinitions = [
+  {
+    id: "cf.dns.record.create.v1",
+    title: "dns · record · create",
+    description: "POST /zones/:zone_id/dns_records",
+  },
+  {
+    id: "cf.workers.route.update.v1",
+    title: "workers · route · update",
+    description: "PUT /zones/:zone_id/workers/routes/:route_id",
+  },
+];
+let enabledPermissions = new Set(permissionDefinitions.map(({ id }) => id));
+
+function permissionsSnapshot() {
+  const enabled = [...enabledPermissions].sort();
+  const permissionsSha256 = createHash("sha256")
+    .update(
+      `zemrip.broker-permissions.v1\ncloudflare\n${JSON.stringify(enabled)}`,
+      "utf8",
+    )
+    .digest("hex");
+  return {
+    provider: "cloudflare",
+    permissions_sha256: permissionsSha256,
+    permissions: permissionDefinitions.map((permission) => ({
+      ...permission,
+      enabled: enabledPermissions.has(permission.id),
+      ceiling: true,
+    })),
+  };
+}
+
+function parsePermissionUpdate(body) {
+  if (
+    body === null ||
+    Array.isArray(body) ||
+    typeof body !== "object" ||
+    Object.keys(body).sort().join(",") !== "enabled,permissions_sha256"
+  ) {
+    return { error: "body must contain exactly enabled and permissions_sha256" };
+  }
+  if (!DIGEST_PATTERN.test(body.permissions_sha256 ?? "")) {
+    return { error: "permissions_sha256 must be 64 lowercase hex characters" };
+  }
+  if (!Array.isArray(body.enabled)) return { error: "enabled must be an array" };
+  const known = new Set(permissionDefinitions.map(({ id }) => id));
+  const enabled = new Set();
+  for (const id of body.enabled) {
+    if (typeof id !== "string" || !known.has(id)) {
+      return { error: `unknown permission ${String(id)}` };
+    }
+    if (enabled.has(id)) return { error: `duplicate permission ${id}` };
+    enabled.add(id);
+  }
+  return { enabled };
+}
 
 // ---------------------------------------------------------------------------
 // Store behaviour
@@ -504,6 +563,7 @@ const server = http.createServer(async (request, response) => {
     return json(response, 200, {
       ticket_list_requests: ticketListRequests,
       decision_posts: decisionPosts,
+      permission_posts: permissionPosts,
       ids,
       ticket_count: tickets.size,
     });
@@ -517,6 +577,32 @@ const server = http.createServer(async (request, response) => {
     ticketListRequests += 1;
     const status = url.searchParams.get("status");
     return json(response, 200, { tickets: listAndMaintain(status) });
+  }
+
+  if (request.method === "GET" && pathname === "/permissions") {
+    return json(response, 200, permissionsSnapshot());
+  }
+
+  if (request.method === "POST" && pathname === "/permissions") {
+    permissionPosts += 1;
+    let body;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      if (error instanceof PayloadTooLargeError) {
+        return json(response, 500, { error: "internal server error" });
+      }
+      return json(response, 400, { error: "invalid JSON body" });
+    }
+    const parsed = parsePermissionUpdate(body);
+    if (parsed.error) return json(response, 400, { error: parsed.error });
+    if (body.permissions_sha256 !== permissionsSnapshot().permissions_sha256) {
+      return json(response, 409, {
+        error: "permissions changed since they were read; refresh before applying",
+      });
+    }
+    enabledPermissions = parsed.enabled;
+    return json(response, 200, permissionsSnapshot());
   }
 
   const detail = pathname.match(/^\/tickets\/([^/]+)$/);
