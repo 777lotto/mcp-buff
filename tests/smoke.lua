@@ -11,6 +11,7 @@ local client_module = require('mcp_buff.client')
 
 local stub
 local panel
+local permissions_panel
 local endpoint
 local ids
 local workspace
@@ -450,11 +451,65 @@ local function test_background_refresh_never_prompts()
   })
 end
 
+local function test_permissions_panel_narrows_cloudflare_runtime_scope()
+  local before = stats().permission_posts
+  panel.open_permissions()
+  permissions_panel = require('mcp_buff.permissions')
+  wait_for(function()
+    local provider = permissions_panel.providers[1]
+    return provider and provider.snapshot ~= nil
+  end, 'permissions panel did not render the broker response')
+
+  local cloudflare = permissions_panel.providers[1]
+  local before_reads = capability_reads()
+  equal(cloudflare.id, 'cloudflare')
+  equal(permissions_panel.providers[2].id, 'github')
+  equal(permissions_panel.providers[2].configured, false)
+  local first = cloudflare.snapshot.permissions[1]
+  equal(first.enabled, true)
+
+  local row
+  for line, mapped in pairs(permissions_panel.line_map) do
+    if mapped.provider == cloudflare and mapped.index == 1 then row = line end
+  end
+  assert(row, 'the first Cloudflare permission was not mapped')
+  vim.api.nvim_set_current_win(permissions_panel.win)
+  vim.api.nvim_win_set_cursor(permissions_panel.win, { row, 0 })
+  permissions_panel.toggle()
+  equal(cloudflare.snapshot.permissions[1].enabled, false)
+
+  local real_input = vim.fn.input
+  vim.fn.input = function()
+    return cloudflare.snapshot.permissions_sha256:sub(-8)
+  end
+  local ok, err = pcall(permissions_panel.apply)
+  vim.fn.input = real_input
+  if not ok then error(err) end
+
+  wait_for(function() return stats().permission_posts == before + 1 end,
+    'permission update did not reach the stub')
+  wait_for(function() return not cloudflare.applying end,
+    'permission update did not settle')
+  equal(cloudflare.snapshot.permissions[1].enabled, false)
+  equal(cloudflare.must_refresh, false)
+  equal(capability_reads(), before_reads,
+    'the permissions view did not share the Cloudflare provider capability cache')
+
+  local request_error, snapshot = async(function(done)
+    admin_client({ permission_provider = 'cloudflare' }):get_permissions(done)
+  end)
+  assert(not request_error, vim.inspect(request_error))
+  equal(snapshot.permissions[1].enabled, false)
+  permissions_panel.close()
+end
+
 local function run()
   start_stub()
   capability_cmd = install_capability_cmd()
 
   assert(vim.fn.exists(':McpBuff') == 2, ':McpBuff command was not registered')
+  assert(vim.fn.exists(':McpBuffPermissions') == 2,
+    ':McpBuffPermissions command was not registered')
   panel = require('mcp_buff')
   panel.setup({
     endpoint = endpoint,
@@ -478,10 +533,12 @@ local function run()
   test_digest_and_state_conflicts_are_distinguished()
   test_deny_reads_denial_note()
   test_background_refresh_never_prompts()
+  test_permissions_panel_narrows_cloudflare_runtime_scope()
 end
 
 local ok, message = xpcall(run, debug.traceback)
 if panel then pcall(panel.close) end
+if permissions_panel then pcall(permissions_panel.close) end
 if stub then
   pcall(function() stub:kill(15) end)
   pcall(function() stub:wait(1000) end)

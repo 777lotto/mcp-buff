@@ -160,6 +160,13 @@ function M.classify(status, body, context)
 
   if status == 409 then
     local text = reported or ''
+    if context == 'permissions' then
+      return {
+        kind = 'permissions_conflict', status = status, definitive = true,
+        message = 'runtime permissions changed after this panel read them (409). '
+          .. 'Refresh and review the new state before applying.',
+      }
+    end
     -- Status alone cannot separate the two 409s; only the message text can.
     if text:find('digest does not match', 1, true) then
       return {
@@ -249,6 +256,7 @@ function Client.new(opts)
     schedule = opts.schedule or vim.schedule,
     defer = opts.defer or function(callback, ms) vim.defer_fn(callback, ms) end,
     capability = opts.capability or capability_module,
+    permission_provider = opts.permission_provider,
   }, Client)
 end
 
@@ -517,9 +525,103 @@ function Client:decide(ticket_id, action, decision, handlers)
   end)
 end
 
+local function valid_permission_snapshot(payload, expected_provider)
+  if type(payload) ~= 'table'
+    or (payload.provider ~= 'github' and payload.provider ~= 'cloudflare')
+    or (expected_provider ~= nil and payload.provider ~= expected_provider)
+    or type(payload.permissions_sha256) ~= 'string'
+    or #payload.permissions_sha256 ~= 64
+    or payload.permissions_sha256:match('^[a-f0-9]+$') == nil
+    or type(payload.permissions) ~= 'table' then
+    return nil, 'the broker returned a malformed permissions document.'
+  end
+  local seen = {}
+  local count = 0
+  for index, permission in ipairs(payload.permissions) do
+    if type(permission) ~= 'table'
+      or type(permission.id) ~= 'string' or permission.id == ''
+      or type(permission.title) ~= 'string' or permission.title == ''
+      or type(permission.description) ~= 'string'
+      or type(permission.enabled) ~= 'boolean'
+      or permission.ceiling ~= true
+      or seen[permission.id] then
+      return nil, ('the broker returned an invalid permission at index %d.'):format(index)
+    end
+    seen[permission.id] = true
+    count = count + 1
+  end
+  for _ in pairs(payload.permissions) do count = count - 1 end
+  if count ~= 0 then
+    return nil, 'the broker returned permissions as something other than a plain array.'
+  end
+  if #payload.permissions == 0 then
+    return nil, 'the broker returned an empty permissions registry.'
+  end
+  return payload
+end
+
+function Client:get_permissions(opts, callback)
+  if type(opts) == 'function' then callback, opts = opts, {} end
+  opts = opts or {}
+  return self:_request('GET', '/permissions', {
+    allow_capability_fetch = opts.allow_capability_fetch,
+    context = 'permissions',
+  }, function(err, payload)
+    if err then return callback(err) end
+    local validated, validation_error = valid_permission_snapshot(
+      payload, self.permission_provider)
+    if not validated then
+      return callback({ kind = 'decode', message = validation_error })
+    end
+    callback(nil, validated)
+  end)
+end
+
+function Client:update_permissions(snapshot, enabled, callback)
+  local current, validation_error = valid_permission_snapshot(
+    snapshot, self.permission_provider)
+  if not current then
+    return callback({ kind = 'configuration', message = validation_error })
+  end
+  if type(enabled) ~= 'table' then
+    return callback({ kind = 'configuration', message = 'enabled permissions must be an array.' })
+  end
+  local known, seen, desired = {}, {}, {}
+  for _, permission in ipairs(current.permissions) do known[permission.id] = true end
+  for index, id in ipairs(enabled) do
+    if type(id) ~= 'string' or not known[id] or seen[id] then
+      return callback({
+        kind = 'configuration',
+        message = ('invalid enabled permission at index %d.'):format(index),
+      })
+    end
+    seen[id] = true
+    desired[#desired + 1] = id
+  end
+  if #desired ~= #enabled then
+    return callback({ kind = 'configuration', message = 'enabled permissions must be a plain array.' })
+  end
+  return self:_request('POST', '/permissions', {
+    body = vim.json.encode({
+      permissions_sha256 = current.permissions_sha256,
+      enabled = desired,
+    }),
+    context = 'permissions',
+  }, function(err, payload)
+    if err then return callback(err) end
+    local validated, response_error = valid_permission_snapshot(
+      payload, self.permission_provider)
+    if not validated then
+      return callback({ kind = 'decode', message = response_error })
+    end
+    callback(nil, validated)
+  end)
+end
+
 M.Client = Client
 M.new = Client.new
 M.statuses = STATUSES
 M.terminal_statuses = TERMINAL_STATUSES
+M.valid_permission_snapshot = valid_permission_snapshot
 
 return M
