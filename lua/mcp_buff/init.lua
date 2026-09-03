@@ -412,7 +412,9 @@ local function show_detail(tab, ticket)
     config.style = 'minimal'
     preview.win = api.nvim_open_win(buf, true, config)
   end
-  api.nvim_set_option_value('wrap', false, { win = preview.win })
+  api.nvim_set_option_value('wrap', true, { win = preview.win })
+  api.nvim_set_option_value('linebreak', true, { win = preview.win })
+  api.nvim_set_option_value('breakindent', true, { win = preview.win })
 
   -- Naming comes last, after the buffer this one replaced is gone. The two are
   -- the same ticket whenever a decision re-renders one, and a name still held

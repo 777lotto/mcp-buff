@@ -48,6 +48,9 @@ Notable changes are recorded here. Releases follow semantic versioning.
 
 ### Changed
 
+- Ticket detail floats now wrap long prose at word boundaries and indent
+  continuation lines, so the complete review context is readable without
+  horizontal scrolling.
 - `bluff` is now the default and only long-lived branch; CI, release
   notification, and contributor guidance no longer retain the retired `bet`
   promotion path.

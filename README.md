@@ -449,7 +449,8 @@ The detail window is a review surface, not a modal: `a`, `d`, `r`, `<CR>`,
 leaves the panel behind. A decision taken there acts on the ticket the window
 is showing, whatever the panel cursor is sitting on underneath. There is one
 detail window, reused: opening another ticket, or deciding this one, replaces
-its contents rather than stacking a second float on top.
+its contents rather than stacking a second float on top. Long prose wraps at
+word boundaries within the float, with continued lines indented for readability.
 
 Closing the panel during an in-flight decision or permission update keeps that
 broker's owned route alive until the result is accounted for, then closes it.
