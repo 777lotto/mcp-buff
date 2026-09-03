@@ -681,6 +681,20 @@ local function test_detail_rendering()
   contains(detail, 'superseded by a fresh ticket')
   -- This ticket is terminal, so there is no approval left to describe.
   excludes(detail, '## What approval does')
+
+  local rejected = vim.deepcopy(DETAIL_TICKET)
+  rejected.status = 'failed'
+  rejected.results[1].status = 400
+  rejected.results[1].outcome = 'rejected'
+  rejected.results[1].response = {
+    success = false,
+    errors = {
+      { code = 10021, message = 'synthetic Cloudflare validation detail' },
+    },
+  }
+  local rejected_detail = render.detail(cloudflare, rejected)
+  contains(rejected_detail, '"code": 10021')
+  contains(rejected_detail, '"message": "synthetic Cloudflare validation detail"')
 end
 
 local function test_git_detail_rendering()
