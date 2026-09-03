@@ -1,41 +1,21 @@
+-- Panel rendering: the tab bar, one provider's tab body, and ticket detail.
+--
+-- Everything here is provider-agnostic scaffolding. Which statuses exist, what
+-- they are called, how a stored request reads, and what an approval licenses
+-- are all answered by the tab's source module (`mcp_buff.sources.*`), so this
+-- file never grows a branch per broker.
+
 local fn = vim.fn
+local sources = require('mcp_buff.sources')
 
 local M = {}
 
-M.status_order = {
-  'pending',
-  'approved',
-  'executing',
-  -- indeterminate is a state of its own. Bucketing an unknown outcome with
-  -- failed is the one presentation it must never be given.
-  'indeterminate',
-  'failed',
-  'denied',
-  'expired',
-  'executed',
-}
-
-local STATUS_LABELS = {
-  pending = 'Pending',
-  approved = 'Approved',
-  executing = 'Executing',
-  executed = 'Executed',
-  failed = 'Failed',
-  indeterminate = 'Indeterminate',
-  denied = 'Denied',
-  expired = 'Expired',
-}
-
-local STATUS_HIGHLIGHTS = {
-  pending = 'McpBuffPending',
-  approved = 'McpBuffApproved',
-  executing = 'McpBuffExecuting',
-  executed = 'McpBuffExecuted',
-  failed = 'McpBuffFailed',
-  indeterminate = 'McpBuffIndeterminate',
-  denied = 'McpBuffDenied',
-  expired = 'McpBuffExpired',
-}
+-- A status the broker served that this release has no entry for. It is given
+-- its own bucket and its own warning, and it is never folded into a status
+-- that happens to be nearby: `failed` would claim the request definitely did
+-- not happen and `pending` would offer a decision, and both would be a guess
+-- about a word this client does not know.
+M.UNKNOWN_STATUS_LABEL = 'Unrecognised status'
 
 local function trim(value)
   return (value or ''):match('^%s*(.-)%s*$')
@@ -57,6 +37,9 @@ local function shorten(text, limit)
   end
   return '…'
 end
+
+M.shorten = shorten
+M.one_line = one_line
 
 -- Gregorian civil date to Unix days, independent of the workstation timezone.
 local function days_from_civil(year, month, day)
@@ -148,185 +131,270 @@ function M.pretty_json(value)
   return table.concat(out)
 end
 
-function M.list(tickets, opts)
-  opts = opts or {}
-  local width = math.max(64, opts.width or 92)
-  local grouped = {}
-  for _, status in ipairs(M.status_order) do grouped[status] = {} end
-  for _, ticket in ipairs(tickets or {}) do
-    local status = grouped[ticket.status] and ticket.status or 'failed'
-    grouped[status][#grouped[status] + 1] = ticket
-  end
-  for _, status in ipairs(M.status_order) do
-    table.sort(grouped[status], function(left, right)
-      return tostring(left.created or '') > tostring(right.created or '')
-    end)
-  end
+-- ---------------------------------------------------------------------------
+-- The panel
+-- ---------------------------------------------------------------------------
 
-  local lines, map, highlights = {}, {}, {}
-  local function emit(text, item, highlight)
-    lines[#lines + 1] = text
-    local line = #lines
-    if item then map[line] = item end
-    if highlight then
-      highlights[#highlights + 1] = {
+--- Accumulate lines, cursor targets, and highlight spans together.
+---
+--- The line map is what makes a keystroke unambiguous: a row is a ticket row, a
+--- permission row, or nothing, and an action that lands on nothing says so
+--- rather than acting on whatever was nearby.
+local function new_buffer(width)
+  return {
+    width = width,
+    lines = {},
+    map = {},
+    highlights = {},
+    emit = function(self, text, item, highlight)
+      self.lines[#self.lines + 1] = text
+      local line = #self.lines
+      if item then self.map[line] = item end
+      if highlight then
+        self.highlights[#self.highlights + 1] = {
+          line = line - 1,
+          start_col = 0,
+          end_col = #text,
+          group = highlight,
+        }
+      end
+      return line
+    end,
+    span = function(self, line, start_col, end_col, group)
+      self.highlights[#self.highlights + 1] = {
         line = line - 1,
-        start_col = 0,
-        end_col = #text,
-        group = highlight,
+        start_col = start_col,
+        end_col = end_col,
+        group = group,
       }
-    end
+    end,
+  }
+end
+
+--- The tab bar: `▸ 1 Cloudflare 2   2 Git*`.
+---
+--- The number after a label is that provider's pending ticket count, and `*`
+--- marks unapplied permission edits. Both are counts of work waiting on the
+--- operator, and putting them on the bar is what lets the inactive tab ask for
+--- attention -- a pending ticket the operator never switched to is exactly the
+--- thing this panel exists to surface.
+local function tab_bar(out, tabs, active_id)
+  local text, spans = '  ', {}
+  for index, tab in ipairs(tabs) do
+    local badge = ''
+    if tab.pending and tab.pending > 0 then badge = ' ' .. tab.pending end
+    if tab.dirty then badge = badge .. '*' end
+    local label = (tab.id == active_id and '▸ ' or '  ')
+      .. index .. ' ' .. tab.label .. badge
+    if index > 1 then text = text .. '   ' end
+    local start_col = #text
+    text = text .. label
+    spans[#spans + 1] = { id = tab.id, start_col = start_col, end_col = #text }
   end
+  local line = out:emit(text)
+  for _, span in ipairs(spans) do
+    out:span(line, span.start_col, span.end_col,
+      span.id == active_id and 'McpBuffTabActive' or 'McpBuffTabInactive')
+  end
+end
 
-  local pending = #(grouped.pending or {})
-  emit(('  MCP Buff  ·  %d pending'):format(pending), nil, 'McpBuffHeader')
-  emit('  <CR> detail · a approve · d deny · r refresh · q close', nil, 'McpBuffHint')
-  if opts.loading then emit('  ◌ Refreshing tickets…', nil, 'McpBuffExecuting') end
-  if opts.error then emit('  ⚠ ' .. shorten(one_line(opts.error), width - 4), nil, 'McpBuffFailed') end
-  emit('')
+--- Group one provider's ticket summaries by status, newest first within a
+--- group, with anything unrecognised collected separately.
+function M.group_tickets(source, tickets)
+  local grouped, unknown = {}, {}
+  for _, status in ipairs(source.status_order) do grouped[status] = {} end
+  for _, ticket in ipairs(tickets or {}) do
+    local bucket = grouped[ticket.status] or unknown
+    bucket[#bucket + 1] = ticket
+  end
+  local function newest_first(left, right)
+    return tostring(left.created or '') > tostring(right.created or '')
+  end
+  for _, status in ipairs(source.status_order) do
+    table.sort(grouped[status], newest_first)
+  end
+  table.sort(unknown, newest_first)
+  return grouped, unknown
+end
 
-  for status_index, status in ipairs(M.status_order) do
+function M.pending_count(source, tickets)
+  local count = 0
+  for _, ticket in ipairs(tickets or {}) do
+    if source.decidable[ticket.status] then count = count + 1 end
+  end
+  return count
+end
+
+local function ticket_row(out, tab, ticket, highlight, now)
+  local age = M.age(ticket.created, now)
+  local prefix = ('     %-3s  %s  '):format(age, tostring(ticket.id or '?'))
+  local room = math.max(8, out.width - fn.strdisplaywidth(prefix))
+  local reason = shorten(one_line(ticket.reason), room)
+  out:emit(prefix .. reason, { kind = 'ticket', tab = tab, ticket = ticket }, highlight)
+end
+
+local function ticket_section(out, tab, now)
+  local source = tab.source
+  local grouped, unknown = M.group_tickets(source, tab.tickets)
+
+  for _, status in ipairs(source.status_order) do
     local group = grouped[status]
-    emit((' ▾ %s  (%d)'):format(STATUS_LABELS[status], #group), nil,
-      STATUS_HIGHLIGHTS[status])
+    out:emit((' ▾ Tickets · %s  (%d)'):format(source.status_labels[status], #group),
+      nil, source.status_highlights[status])
     if #group == 0 then
-      emit('     (none)', nil, 'McpBuffHint')
+      out:emit('     (none)', nil, 'McpBuffHint')
     else
       for _, ticket in ipairs(group) do
-        local age = M.age(ticket.created, opts.now)
-        local prefix = ('     %-3s  %s  '):format(age, tostring(ticket.id or '?'))
-        local reason = shorten(one_line(ticket.reason), math.max(8, width - fn.strdisplaywidth(prefix)))
-        emit(prefix .. reason, { kind = 'ticket', ticket = ticket }, STATUS_HIGHLIGHTS[status])
+        ticket_row(out, tab, ticket, source.status_highlights[status], now)
       end
     end
-    if status_index < #M.status_order then emit('') end
+    out:emit('')
   end
 
-  return { lines = lines, map = map, highlights = highlights, pending = pending }
+  if #unknown > 0 then
+    out:emit((' ▾ Tickets · %s  (%d)'):format(M.UNKNOWN_STATUS_LABEL, #unknown),
+      nil, 'McpBuffIndeterminate')
+    out:emit('     A status this release has no entry for. Neither decidable',
+      nil, 'McpBuffHint')
+    out:emit('     nor known to be finished.', nil, 'McpBuffHint')
+    for _, ticket in ipairs(unknown) do
+      ticket_row(out, tab, ticket, 'McpBuffIndeterminate', now)
+    end
+    out:emit('')
+  end
 end
 
-local function json_block(lines, value)
-  lines[#lines + 1] = '```json'
-  vim.list_extend(lines, vim.split(M.pretty_json(value), '\n', { plain = true }))
-  lines[#lines + 1] = '```'
+local function permission_state(tab)
+  if tab.permissions.applying then return 'applying…' end
+  if tab.permissions.loading then return 'loading…' end
+  if tab.permissions.outcome_unknown then return 'apply outcome unknown' end
+  if tab.permissions.error then return 'unavailable' end
+  if not tab.permissions.snapshot then return 'not loaded' end
+  local changed = tab.permissions.changed or 0
+  if changed > 0 then return ('%d unsaved change%s'):format(changed, changed == 1 and '' or 's') end
+  return 'saved'
 end
+
+local function permission_section(out, tab)
+  local state = tab.permissions
+  out:emit((' ▾ Runtime permissions   [%s]'):format(permission_state(tab)),
+    nil, 'McpBuffHeader')
+  out:emit('     Narrows this broker below its compiled ceiling. Never a',
+    nil, 'McpBuffHint')
+  out:emit('     credential or app-permission editor.', nil, 'McpBuffHint')
+
+  if state.error then
+    out:emit('     ⚠ ' .. shorten(one_line(state.error), math.max(8, out.width - 8)),
+      nil, 'McpBuffFailed')
+  end
+  if not state.snapshot then
+    out:emit('')
+    return
+  end
+
+  local digest = state.snapshot.permissions_sha256
+  out:emit(('     state %s…%s'):format(digest:sub(1, 8), digest:sub(-8)), nil, 'McpBuffHint')
+  if state.outcome_unknown then
+    out:emit('     APPLY OUTCOME UNKNOWN — refresh before making another change.',
+      nil, 'McpBuffFailed')
+  elseif state.must_refresh then
+    out:emit('     STATE MAY BE STALE — refresh before changing or applying.',
+      nil, 'McpBuffIndeterminate')
+  end
+
+  for index, permission in ipairs(state.snapshot.permissions) do
+    local marker = permission.enabled and '[x]' or '[ ]'
+    local edited = permission.enabled ~= state.baseline[permission.id]
+    local title = shorten(one_line(permission.title), 30)
+    local room = math.max(18, out.width - 41)
+    out:emit(('   %s %s %-30s %s'):format(
+      marker, edited and '·' or ' ', title,
+      shorten(one_line(permission.description), room)),
+      { kind = 'permission', tab = tab, index = index },
+      permission.enabled and 'McpBuffPermissionEnabled' or 'McpBuffPermissionDisabled')
+    out:emit('           ' .. permission.id, nil, 'McpBuffHint')
+  end
+  out:emit('')
+end
+
+--- Render the whole panel for one active tab.
+---
+--- @param tabs table each entry: id, label, pending, dirty
+--- @param tab table the active tab: source, tickets, permissions, broker state
+function M.panel(tabs, tab, opts)
+  opts = opts or {}
+  local out = new_buffer(math.max(64, opts.width or 92))
+
+  out:emit('  MCP Buff · Broker Review', nil, 'McpBuffHeader')
+  tab_bar(out, tabs, tab.id)
+  out:emit('  <CR> detail/toggle · a approve · d deny · A apply permissions', nil, 'McpBuffHint')
+  out:emit('  <Tab> next tab · 1-' .. #tabs .. ' jump · r refresh · q close', nil, 'McpBuffHint')
+
+  if not tab.configured then
+    out:emit('')
+    out:emit(('  %s has no capability_cmd, so this tab cannot authenticate.')
+      :format(tab.source.title), nil, 'McpBuffFailed')
+    out:emit(('  Set %s in setup() to an argv list that prints its 64-hex '
+      .. 'admin capability.'):format(tab.source.capability_cmd_key),
+      nil, 'McpBuffHint')
+    out:emit('')
+    return { lines = out.lines, map = out.map, highlights = out.highlights }
+  end
+
+  if tab.loading then out:emit('  ◌ Refreshing…', nil, 'McpBuffExecuting') end
+  if tab.error then
+    out:emit('  ⚠ ' .. shorten(one_line(tab.error), out.width - 4), nil, 'McpBuffFailed')
+  end
+  out:emit('')
+
+  ticket_section(out, tab, opts.now)
+  if tab.shows_permissions then permission_section(out, tab) end
+
+  return { lines = out.lines, map = out.map, highlights = out.highlights }
+end
+
+-- ---------------------------------------------------------------------------
+-- Ticket detail
+-- ---------------------------------------------------------------------------
 
 local function bullet(label, value)
   return ('- **%s:** %s'):format(label, tostring(value))
 end
 
-local function request_lines(lines, ticket)
+local function request_lines(lines, source, ticket)
   lines[#lines + 1] = ''
   lines[#lines + 1] = '## Stored requests'
-  for index, request in ipairs(ticket.requests or {}) do
+  local requests = ticket.requests or {}
+  if #requests == 0 then
     lines[#lines + 1] = ''
-    lines[#lines + 1] = ('### Step %d'):format(index - 1)
-    lines[#lines + 1] = ''
-    lines[#lines + 1] = ('`%s %s`'):format(tostring(request.method or '?'), tostring(request.path or '?'))
-    lines[#lines + 1] = ''
-    if request.body == nil then
-      lines[#lines + 1] = '_No request body._'
-    else
-      json_block(lines, request.body)
-    end
-
-    -- The structured precondition is part of what the operator reviews: it is
-    -- inside the digest, and it is the evidence the broker will re-check.
-    local precondition = request.precondition
-    lines[#lines + 1] = ''
-    if type(precondition) ~= 'table' then
-      lines[#lines + 1] = '_No stored precondition._'
-    else
-      lines[#lines + 1] = ('**Precondition:** `%s %s`'):format(
-        tostring(precondition.method or '?'), tostring(precondition.path or '?'))
-      local expect = precondition.expect
-      if type(expect) == 'table' then
-        lines[#lines + 1] = ''
-        lines[#lines + 1] = bullet('Expected status', expect.status or '?')
-        if expect.result_sha256 then
-          lines[#lines + 1] = bullet('Expected result_sha256', expect.result_sha256)
-        end
-        if expect.etag then
-          lines[#lines + 1] = bullet('Expected ETag', expect.etag)
-        end
-      end
-    end
-  end
-end
-
-local function preflight_lines(lines, ticket)
-  lines[#lines + 1] = ''
-  lines[#lines + 1] = '## Preflight observations'
-  local observations = ticket.preflight_results or {}
-  if #observations == 0 then
-    lines[#lines + 1] = ''
-    lines[#lines + 1] = '_No precondition has been checked._'
+    -- Both brokers reject a ticket with no request, so this is a served
+    -- document that should not exist rather than an empty-but-fine ticket.
+    lines[#lines + 1] = '_This ticket carries no request. It licenses nothing '
+      .. 'that mcp-buff can show; do not approve it._'
     return
   end
-  for _, observation in ipairs(observations) do
+  for index, request in ipairs(requests) do
+    local scope = sources.match_scope(source, request)
     lines[#lines + 1] = ''
-    lines[#lines + 1] = ('### Step %s · %s · %s'):format(
-      tostring(observation.index or '?'),
-      tostring(observation.phase or '?'),
-      observation.matched and 'matched' or 'DID NOT MATCH')
+    lines[#lines + 1] = ('### Step %d · %s'):format(index - 1, scope.title)
     lines[#lines + 1] = ''
-    lines[#lines + 1] = bullet('Checked', observation.checked or '?')
-    lines[#lines + 1] = ('- **Status:** expected %s, observed %s'):format(
-      tostring(observation.expected_status or '?'),
-      tostring(observation.observed_status or 'none'))
-    if observation.expected_result_sha256 or observation.observed_result_sha256 then
-      lines[#lines + 1] = ('- **result_sha256:** expected %s, observed %s'):format(
-        tostring(observation.expected_result_sha256 or 'none'),
-        tostring(observation.observed_result_sha256 or 'none'))
-    end
-    if observation.expected_etag or observation.observed_etag then
-      lines[#lines + 1] = ('- **ETag:** expected %s, observed %s'):format(
-        tostring(observation.expected_etag or 'none'),
-        tostring(observation.observed_etag or 'none'))
-    end
-    if observation.error_id then
-      lines[#lines + 1] = bullet('Error id', observation.error_id)
-    end
+    scope.render(lines, request, M)
   end
 end
 
-local function result_lines(lines, ticket)
-  lines[#lines + 1] = ''
-  lines[#lines + 1] = '## Results'
-  if #(ticket.results or {}) == 0 then
-    lines[#lines + 1] = ''
-    lines[#lines + 1] = '_No request has executed._'
-    return
-  end
-  for _, result in ipairs(ticket.results) do
-    lines[#lines + 1] = ''
-    -- outcome is the broker's own word for what happened. "indeterminate" here
-    -- means the mutation may or may not have reached Cloudflare.
-    local outcome = tostring(result.outcome or (result.ok and 'succeeded' or 'rejected'))
-    local status = result.status and ('HTTP ' .. tostring(result.status)) or 'no HTTP response'
-    lines[#lines + 1] = ('### Step %s · %s · %s'):format(
-      tostring(result.index or '?'), outcome, status)
-    lines[#lines + 1] = ''
-    lines[#lines + 1] = ('`%s %s`'):format(tostring(result.method or '?'), tostring(result.path or '?'))
-    if result.error then
-      lines[#lines + 1] = ''
-      lines[#lines + 1] = '**Error:** ' .. tostring(result.error)
-    end
-    lines[#lines + 1] = ''
-    json_block(lines, result.response)
-  end
-end
-
-function M.detail(ticket)
+function M.detail(source, ticket)
   local lines = {
-    '# Ticket `' .. tostring(ticket.id or '?') .. '`',
+    ('# %s `%s`'):format(source.tab_label, tostring(ticket.id or '?')),
     '',
+    bullet('Broker', source.title),
     bullet('Status', ticket.status or '?'),
     bullet('Created', ticket.created or '?'),
     -- expires is rendered on every path: a ticket can expire between the read
     -- and the decision, and the operator has to be able to see that coming.
     bullet('Expires', ticket.expires or '?'),
-    bullet('Requests', #(ticket.requests or {})),
+  }
+  vim.list_extend(lines, source.detail_facts(ticket))
+  vim.list_extend(lines, {
     '',
     '- **ticket_sha256:**',
     '  `' .. tostring(ticket.ticket_sha256 or 'missing') .. '`',
@@ -334,20 +402,24 @@ function M.detail(ticket)
     '## Reason',
     '',
     tostring(ticket.reason or ''),
-  }
+  })
 
-  request_lines(lines, ticket)
-  preflight_lines(lines, ticket)
-  result_lines(lines, ticket)
-
-  if ticket.status == 'indeterminate' then
-    lines[#lines + 1] = ''
-    lines[#lines + 1] = '## Indeterminate'
-    lines[#lines + 1] = ''
-    lines[#lines + 1] = 'The outcome of this ticket is genuinely unknown: a mutation '
-      .. 'may or may not have reached Cloudflare. Inspect it upstream. This is not '
-      .. 'a retry signal, and this ticket must never be replayed.'
+  -- Only on a ticket that can still be decided. On a decided one the sentence
+  -- would describe an offer that is no longer open, and the status sections
+  -- below already say what happened instead.
+  if source.decidable[ticket.status] then
+    vim.list_extend(lines, {
+      '',
+      '## What approval does',
+      '',
+      'Approving this ticket authorises ' .. source.approval_grant,
+      '',
+      'Denying it authorises ' .. source.denial_grant,
+    })
   end
+
+  request_lines(lines, source, ticket)
+  source.detail_sections(lines, ticket, M)
 
   -- The broker returns the denial reason as denial_note, not note.
   if ticket.denial_note then
@@ -361,16 +433,43 @@ function M.detail(ticket)
   return table.concat(lines, '\n')
 end
 
+-- Beyond this many steps the prompt stops being readable, and an unreadable
+-- prompt is one the operator scrolls past.
+local PROMPT_STEP_LIMIT = 6
+
 --- The typed-confirmation prompt.
 ---
 --- The contract requires the operator to type the digest's final eight
 --- characters. A single keypress bound to "approve" does not satisfy it, and
 --- neither does a yes/no prompt.
-function M.confirm_prompt(ticket, action)
+---
+--- Two things beyond the digest are here rather than only in the detail buffer.
+--- What the decision authorises, because the brokers mean different things by
+--- "approve" -- one executes now, one unlocks something later. And one line per
+--- step naming its scope, because that is where a scope this release cannot
+--- name says so, at the moment the keystroke becomes irrevocable.
+function M.confirm_prompt(source, ticket, action)
   local digest = tostring(ticket.ticket_sha256 or '')
   local suffix = digest:sub(-8)
-  return ('ticket_sha256: %s\nType the final digest bytes %s to %s: '):format(
-    digest, suffix, action)
+  local grant = action == 'approve' and source.approval_grant or source.denial_grant
+  local out = {
+    ('%s · %s'):format(source.title, tostring(ticket.id or '?')),
+    'ticket_sha256: ' .. digest,
+    ('This %s authorises %s'):format(action, grant),
+  }
+  local requests = ticket.requests or {}
+  for index = 1, math.min(#requests, PROMPT_STEP_LIMIT) do
+    local request = requests[index]
+    local scope = sources.match_scope(source, request)
+    out[#out + 1] = ('  step %d · %s · %s'):format(
+      index - 1, scope.title, one_line(scope.summary(request)))
+  end
+  if #requests > PROMPT_STEP_LIMIT then
+    out[#out + 1] = ('  … and %d more step(s); read them in the detail view')
+      :format(#requests - PROMPT_STEP_LIMIT)
+  end
+  out[#out + 1] = ('Type the final digest bytes %s to %s: '):format(suffix, action)
+  return table.concat(out, '\n')
 end
 
 function M.digest_suffix(ticket)

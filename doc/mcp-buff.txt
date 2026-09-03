@@ -7,14 +7,15 @@ CONTENTS                                                     *mcp-buff-contents*
 2. Installation ......................................... |mcp-buff-installation|
 3. Tunnel ..................................................... |mcp-buff-tunnel|
 4. Capability ............................................. |mcp-buff-capability|
-5. Runtime permissions ................................... |mcp-buff-permissions|
-6. Command and keys ......................................... |mcp-buff-commands|
-7. Review flow ................................................ |mcp-buff-review|
-8. Decision outcomes ........................................ |mcp-buff-outcomes|
-9. Configuration ............................................. |mcp-buff-config|
-10. Lua API ...................................................... |mcp-buff-api|
-11. Security ............................................... |mcp-buff-security|
-12. Development ......................................... |mcp-buff-development|
+5. Broker tabs .................................................. |mcp-buff-tabs|
+6. Runtime permissions ................................... |mcp-buff-permissions|
+7. Commands and keys ........................................ |mcp-buff-commands|
+8. Review flow ................................................ |mcp-buff-review|
+9. Decision outcomes ........................................ |mcp-buff-outcomes|
+10. Configuration ............................................ |mcp-buff-config|
+11. Lua API ...................................................... |mcp-buff-api|
+12. Security .............................................. |mcp-buff-security|
+13. Development ........................................ |mcp-buff-development|
 
 ==============================================================================
 1. REQUIREMENTS                                           *mcp-buff-requirements*
@@ -23,7 +24,10 @@ Neovim 0.10 or newer, curl on $PATH, SSH access (or an existing local forward)
 to an installed broker admin listener, and a command that can print each
 broker's admin capability. McpBuff has no Lua or Neovim plugin dependencies.
 
-It never accepts a Cloudflare token and never calls Cloudflare directly.
+It never accepts a provider token and never calls Cloudflare or GitHub
+directly. The GitHub broker's review plane is optional and off by default on
+the host; a tab whose broker has no capability_cmd says what is missing rather
+than disappearing.
 
 Version 2 speaks the hardened admin contract. It is not compatible with a
 broker release that predates bearer authentication and digest-bound decisions,
@@ -40,21 +44,23 @@ With lazy.nvim: >lua
       cmd = { "McpBuff", "McpBuffPermissions" },
       keys = {
         { "<leader>mb", "<cmd>McpBuff<cr>",
-          desc = "Cloudflare write tickets" },
+          desc = "Broker write tickets" },
         { "<leader>mp", "<cmd>McpBuffPermissions<cr>",
           desc = "Broker permissions" },
       },
       opts = {
+        -- The unprefixed keys configure the Cloudflare broker.
         endpoint = "http://127.0.0.1:8792",
         capability_cmd = { "pass", "show", "your/broker/admin-capability" },
         tunnel = { host = "your-broker-host" },
-        permissions = {
-          github = {
-            capability_cmd = {
-              "pass", "show", "your/github/admin-capability"
-            },
-            tunnel = { host = "your-broker-host" },
+        -- The GitHub broker: one connection, serving its tickets and
+        -- its permissions both.
+        github = {
+          endpoint = "http://127.0.0.1:8793",
+          capability_cmd = {
+            "pass", "show", "your/github/admin-capability"
           },
+          tunnel = { host = "your-broker-host" },
         },
       },
     }
@@ -64,7 +70,9 @@ setup() must be called, because capability_cmd has no default.
 ==============================================================================
 3. TUNNEL                                                       *mcp-buff-tunnel*
 
-McpBuff can own a forward for the lifetime of the review panel: >lua
+McpBuff can own a forward for the lifetime of the review panel, per broker. A
+tunnel is never inherited between brokers: two brokers reachable through one
+SSH alias still need two forwards to two ports. >lua
 
     tunnel = {
       host = "your-broker-host",
@@ -72,7 +80,8 @@ McpBuff can own a forward for the lifetime of the review panel: >lua
       startup_timeout = 30000,
     }
 <
-Opening :McpBuff launches one foreground process, with no shell: >
+The first visit to that broker's tab launches one foreground process, with no
+shell: >
 
     ssh -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes
       -o ServerAliveInterval=15 -o ServerAliveCountMax=3
@@ -80,9 +89,13 @@ Opening :McpBuff launches one foreground process, with no shell: >
       -L 127.0.0.1:8792:127.0.0.1:8792 your-broker-host
 <
 McpBuff waits for the listener before reading the capability or sending HTTP.
-Closing the panel by any route terminates only this SSH child; VimLeavePre does
-the same. An in-flight decision keeps the route until its outcome is resolved,
-then closes it. McpBuff does not manage an underlying VPN.
+Closing the panel by any route terminates only these SSH children; VimLeavePre
+does the same. An in-flight decision or permission update keeps that broker's
+route until its outcome is resolved, then closes it. McpBuff does not manage
+an underlying VPN.
+
+A forward opens when the operator visits that broker's tab, and only then.
+Opening the panel does not reach a broker whose tab you have not selected.
 
 Managed mode refuses an already occupied local port. It never sends the admin
 capability through a listener whose ownership it cannot prove. Use a dedicated
@@ -125,122 +138,250 @@ a configuration file fed on standard input.
 The value is held for capability_ttl seconds so that refreshing the panel does
 not re-run the command for every request, and is dropped when the review
 session closes, when Neovim exits, and whenever setup() runs again. An
-in-flight decision delays teardown until its outcome resolves. A 401 triggers
-exactly one forced re-read, in case the capability was rotated mid-session,
-and the failure is then surfaced rather than retried.
+in-flight decision or permission update delays that broker's teardown until
+its outcome resolves. A 401 triggers exactly one forced re-read, in case the
+capability was rotated mid-session, and the failure is then surfaced rather
+than retried.
+
+Concurrent reads of one capability share a single fetch. A tab reads its
+ticket list and its permission document at the same moment and both need the
+same bearer, so without coalescing one keystroke would run capability_cmd
+twice and raise two pinentry prompts for one credential.
+
+Two brokers never share a bearer value.  *mcp-buff-capability-isolation*
+Each has its own capability_cmd, its own in-memory cache object, its own
+endpoint, and its own optional managed tunnel. The isolation is structural:
+they are separate cache instances, not separate call sites that are careful.
 
 A failed capability read aborts the request. McpBuff never falls back to
 sending an unauthenticated request, because that failure would reach you as an
 opaque 401 rather than as "your card is not available".
 
 The background refresh timer never runs capability_cmd.  *mcp-buff-no-prompts*
-If the cached value has expired, a timer tick is skipped instead. This makes a
-credential prompt storm structurally impossible rather than merely unlikely.
-Press r when you want the panel to acquire a capability again.
+It also never opens a forward, and it never touches a broker whose tab is not
+visible. If the cached value has expired, or the managed route is closed, the
+tick is skipped instead. This makes a credential prompt storm and a
+timer-opened SSH route both structurally impossible rather than merely
+unlikely. Press r when you want the panel to acquire a capability again.
 
 ==============================================================================
-5. RUNTIME PERMISSIONS                                    *mcp-buff-permissions*
+5. BROKER TABS                                                  *mcp-buff-tabs*
 
-:McpBuffPermissions opens effective runtime switches for the Cloudflare and
-GitHub brokers. These switches can only narrow the compiled, reviewed broker
-policy. They cannot add an operation, change a route, edit a credential,
-alter GitHub App permissions, or expand a Cloudflare API token.
+:McpBuff opens one panel with a tab per configured broker. Each tab holds that
+broker's ticket queue and its runtime permission subset, because everything
+about one provider shares one capability, one loopback socket, and one blast
+radius. >
+
+      MCP Buff · Broker Review
+      ▸ 1 Cloudflare 2    2 Git 3
+<
+The number after a label is that broker's pending ticket count, and * marks
+unapplied permission edits, so a tab you are not looking at can still ask for
+attention.
+
+Only the visible tab is read. Switching to a tab for the first time is what
+reads its capability and opens its forward; returning to it renders what is
+already held, so cycling tabs never re-prompts. r forces a re-read.
+
+Cloudflare                                                *mcp-buff-cloudflare*
+
+Cloudflare has no native proposal object for a DNS or Worker mutation, so its
+broker manufactures one per mutation and executes it inside the approval POST.
+Approval is therefore terminal, the interesting evidence is the preflight
+observation and the result, and indeterminate is a first-class state; see
+|mcp-buff-indeterminate|.
+
+Git                                                              *mcp-buff-git*
+
+GitHub needs far fewer tickets, because pull requests already provide a diff
+and a review surface. What it does need a ticket for is the small set of
+scopes that reach past that surface. Today there is one: a push that changes
+.github/workflows/**. A push to an agent branch runs Actions on that branch
+before any pull request is read, so workflows: write is gated on a human
+decision rather than on the ref filter that guards every other push.
+
+Approval here executes nothing. It unlocks a token that a later push, on a
+different connection, may spend — or may never spend. Three consequences are
+visible in the panel:
+
+- approved is not terminal. An approved, unspent ticket is an outstanding
+  grant, listed as "Approved · unspent" directly under Pending, and its detail
+  says the grant is still open. There is no transition back to pending and no
+  deny transition from approved, so an approval cannot be withdrawn through
+  this protocol.
+- A successful approve returns approved, and that is the answer. McpBuff does
+  not then poll for a terminal state it may never reach; see
+  |mcp-buff-settled|.
+- "Spent" records that the grant was claimed, not that the push reached
+  GitHub. A push that fails at GitHub still burns its approval. GitHub's own
+  log is the record of what landed.
+
+A ticket licenses one push, of exactly the ref set it names, to one
+repository. The ref set is the grant, so every ref is rendered — never a count
+and an ellipsis.
+
+More GitHub scopes                                            *mcp-buff-scopes*
+
+More GitHub scopes are expected, and the panel is built for them. Each source
+module owns a scope registry, and one entry is a shape, a one-line summary,
+and a renderer. Nothing outside lua/mcp_buff/sources/github.lua changes: the
+panel, the client, and the renderer never learn a scope's name.
+
+The shape match is exact and total, and that direction is the safety property.
+Every declared key must be present with the declared type, and no key beyond
+the declaration may appear. So when a broker release adds a term to a request,
+the shape stops matching and the request falls through to the
+unrecognised-scope renderer, which shows the whole record and says McpBuff
+cannot describe it. A tolerant match would instead render the new term's
+ticket under the old shape's description, and the operator would approve a
+grant whose extra term was never on screen. Failing to recognise a request is
+recoverable; describing it wrongly is not.
+
+An unrecognised scope is still decidable. Its digest still verifies and its
+whole record is still shown, and refusing would leave you with no review
+surface at all for a broker newer than the panel. The confirmation prompt
+names it as unrecognised, at the keystroke.
+
+Unrecognised statuses                                  *mcp-buff-unknown-status*
+
+A status the broker served that this release has no entry for is collected in
+its own group, with a warning that it is neither decidable nor known to be
+finished. Folding it into failed would assert the request definitely did not
+happen; folding it into pending would offer a decision. Both are claims about
+a word McpBuff does not know.
+
+==============================================================================
+6. RUNTIME PERMISSIONS                                    *mcp-buff-permissions*
+
+Each tab carries its broker's runtime permission subset below its ticket
+queue. These switches can only narrow the compiled, reviewed broker policy.
+They cannot add an operation, change a route, edit a credential, alter GitHub
+App permissions, or expand a Cloudflare API token.
+
+The effective authorization is the intersection: >
+
+    upstream credential ceiling
+      ∩ compiled broker registry and route policy
+      ∩ persisted runtime enabled set
+      = operation that can execute
+<
+The panel can remove IDs only from the innermost term.
 
 Cloudflare entries correspond one-for-one with compiled mutation operation
 IDs. GitHub groups cover MCP, Git read, agent-branch push, reviewed workflow
 push, API reads, issue writes, pull-request writes, and gated merge.
 
-Space or Enter toggles a row. Press a to apply the selected provider after
-typing the final eight characters of its current state digest. The complete
-digest is sent with the desired subset, so a concurrent change answers 409
-and must be refreshed. An unaccounted-for POST is never retried; the panel
-marks the state unknown and requires a fresh read.
+Space or Enter toggles a row. Press A to apply, after typing the final eight
+characters of the current state digest. The active tab is the apply target;
+there is nothing to infer from the cursor row. The complete digest is sent
+with the desired subset, so a concurrent change answers 409 and must be
+refreshed.
 
-Cloudflare permissions share the main Cloudflare capability and managed
-tunnel. GitHub defaults to http://127.0.0.1:8793 and uses a distinct
-capability cache and optional tunnel: >lua
+Unlike a ticket decision, a permission update has no operation ID to poll
+after an interrupted POST. A network failure, timeout, or undecodable body is
+therefore reported as outcome unknown and never retried, because the first
+write may have committed. A fresh read is the only recovery.
 
-    permissions = {
-      cloudflare = {},
-      github = {
-        capability_cmd = {
-          "pass", "show", "your/github/admin-capability"
-        },
-        tunnel = { host = "your-broker-host" },
-      },
-    }
-<
-Set either provider to false to hide it. GitHub remains visibly unconfigured
-until its capability_cmd is supplied. Broker releases without GET /permissions
+Set permissions = false on a broker to hide its section, or the broker itself
+to false to drop its tab entirely. Broker releases without GET /permissions
 and POST /permissions must be upgraded; do not weaken the admin boundary.
 
 ==============================================================================
-6. COMMAND AND KEYS                                          *mcp-buff-commands*
+7. COMMANDS AND KEYS                                         *mcp-buff-commands*
 
-:McpBuff        Open the ticket panel as a left split.
-:McpBuffPermissions
-                Open the provider runtime-permissions panel as a left split.
+:McpBuff [provider]
+                Open the review panel as a left split. With a provider id
+                (cloudflare or github) it opens straight to that tab, without
+                reading the other broker's capability on the way.
+:McpBuffPermissions [provider]
+                Open the panel with the cursor on that tab's permissions
+                section.
 
 The following mappings are local to the panel buffer:
 
-<CR>            Re-fetch and open the full ticket detail. LF and keypad Enter
+<Tab>           Next broker tab.
+<S-Tab>         Previous broker tab.
+1 .. N          Jump to a broker tab.
+<CR>            On a ticket row, re-fetch and open the full detail. On a
+                permission row, toggle it locally. LF and keypad Enter
                 perform the same action.
-a               Re-fetch, review, and approve a pending ticket after typing
+a               Re-fetch, review, and approve a decidable ticket after typing
                 the digest confirmation.
-d               Re-fetch, review, and deny a pending ticket with an optional
-                note after typing the digest confirmation.
-r               Refresh the ticket list.
-q               Close the panel and its managed tunnel. In detail, q or <Esc>
-                closes the float.
+d               Re-fetch, review, and deny a decidable ticket with an
+                optional note after typing the digest confirmation.
+<Space>         Toggle a runtime permission locally.
+A               Apply this tab's permission changes after typing the state
+                digest confirmation.
+r               Refresh this tab.
+q               Close the panel and every managed tunnel. In detail, q or
+                <Esc> closes the float.
 
-In the permissions panel, Space or Enter toggles a permission, a applies the
-selected provider after typed digest confirmation, r refreshes both providers,
-and q closes the panel. An in-flight update retains its owned route until the
-outcome is accounted for.
+Closing the panel during an in-flight decision or permission update keeps that
+broker's owned route alive until the result is accounted for, then closes it.
 
 ==============================================================================
-7. REVIEW FLOW                                                 *mcp-buff-review*
+8. REVIEW FLOW                                                 *mcp-buff-review*
 
-The panel groups tickets pending-first, followed by approved, executing,
-indeterminate, failed, denied, expired, and executed. Rows show age, the
-complete ticket ID, and a reason excerpt.
+Each tab groups its own broker's statuses, pending first. Cloudflare:
+pending, approved, executing, indeterminate, failed, denied, expired,
+executed. Git: pending, approved (unspent), consumed (spent), denied,
+expired. Anything else is grouped per |mcp-buff-unknown-status|. Rows show
+age, the complete ticket ID, and a reason excerpt.
 
-<CR> opens the full reason, the expiry, the complete ticket_sha256, each
-stored request as method, literal path and pretty-printed JSON body, each
-request's structured precondition, every preflight observation, and every
-result.
+<CR> opens the full reason, the expiry, the complete ticket_sha256, what
+approval authorises, and every reviewable term of every stored request. For
+Cloudflare that is each method, literal path and pretty-printed JSON body,
+each request's structured precondition, every preflight observation, and every
+result. For Git it is the repository and every ref in the licensed set.
 
 A decision never acts from the summary cache. It re-fetches the full ticket,
-refuses anything that is not pending, and recomputes ticket_sha256 locally
-from the ticket's own immutable fields.
+refuses anything that broker cannot decide, and recomputes ticket_sha256
+locally from the ticket's own immutable fields, in that broker's own digest
+domain.
 
 Digest recomputation                                         *mcp-buff-digest*
 
-The digest covers exactly id, created, expires, reason and requests, hashed
-as: >
+The digest covers exactly id, created, expires, reason and requests — the same
+five immutable fields on both brokers. Only the domain prefix differs: >
 
     sha256("zemrip.mcp-ticket.v1" + "\n" + canonicalJson(payload))
+    sha256("zemrip.git-ticket.v1" + "\n" + canonicalJson(payload))
 <
-McpBuff recomputes it and refuses to submit when the result disagrees with the
-served value. It also refuses when the payload contains anything it cannot
-canonicalise to the same bytes the broker would produce — in practice a
+That difference is load-bearing.                       *mcp-buff-digest-domain*
+The two brokers hold different powers and are reviewed in the same panel. A
+shared prefix would make a digest you typed for a Cloudflare ticket a valid
+digest for a git ticket carrying an identical immutable payload — exactly the
+cross-ticket replay the digest exists to stop. Different power, different
+domain separator. Nothing in McpBuff defaults the domain: a verification
+called without one refuses rather than picking.
+
+McpBuff recomputes the digest and refuses to submit when the result disagrees
+with the served value. It also refuses when the payload contains anything it
+cannot canonicalise to the same bytes the broker would produce — in practice a
 non-integer number or a non-ASCII object key. Refusing is deliberate: a
 guessed digest would let you approve a payload you had not actually verified.
 
 What the digest does and does not guard: it catches a cross-ticket replay, a
-client-side digest bug, and direct tampering with the stored ticket. It does
-not detect a concurrent decision, because the five immutable fields never
-change; a ticket approved, denied, or expired between your read and your
-submission keeps an identical digest, and that race is caught by the ticket
-state machine instead.
+cross-broker replay, a client-side digest bug, and direct tampering with the
+stored ticket. It does not detect a concurrent decision, because the five
+immutable fields never change; a ticket approved, denied, or expired between
+your read and your submission keeps an identical digest, and that race is
+caught by the ticket state machine instead.
 
 Typed confirmation                                          *mcp-buff-confirm*
 
 After the render, McpBuff requires you to type the final eight characters of
-the digest: >
+the digest. The prompt also names the broker and says what the decision
+authorises, because the two brokers mean different things by "approve", and
+one line per step names its scope: >
 
-    ticket_sha256: 9f2c...a41b7e3d
-    Type the final digest bytes a41b7e3d to approve:
+    GitHub broker · t_20260903T090000.000Z_0000000000b1
+    ticket_sha256: fb00f5ea...ab87116d
+    This approve authorises no immediate action. It unlocks that scope for
+    one later push, which is spent before a byte is forwarded and cannot be
+    reused.
+      step 0 · Workflow-changing push · 777lotto/zemrip · 1 ref
+    Type the final digest bytes ab87116d to approve:
 <
 There is no single-keypress approval and no yes/no prompt. Anything other than
 the exact suffix cancels, and nothing is sent.
@@ -248,114 +389,169 @@ the exact suffix cancels, and nothing is sent.
 The plugin cannot edit a ticket and supplies no requests at approval time.
 
 ==============================================================================
-8. DECISION OUTCOMES                                         *mcp-buff-outcomes*
+9. DECISION OUTCOMES                                         *mcp-buff-outcomes*
 
 A decision is never resubmitted.                       *mcp-buff-no-resubmit*
 
-Resubmitting cannot execute a ticket twice — the broker's state machine has no
-edge back to approved, so a second POST loses and receives a 409. The reason
-not to resubmit is that the 409 destroys the account of what happened: it
-carries the same shape as an expiry and a denial made elsewhere, and it tells
-you only where the ticket stands now, not whether your first submission's
-mutations reached Cloudflare.
+Resubmitting cannot decide a ticket twice — neither state machine has an edge
+back to pending, so a second POST loses and receives a 409. The reason not to
+resubmit is that the 409 destroys the account of what happened: it carries the
+same shape as an expiry and a decision made elsewhere, and it tells you only
+where the ticket stands now, not what your first submission did.
 
 So when a decision POST fails, times out, or returns a body McpBuff cannot
-read, it polls that same ticket every two seconds until it reaches a terminal
-state, up to poll_deadline. On the deadline, or if the ticket cannot be
-fetched at all, it reports the outcome as unknown and stops.
+read, it polls that same ticket every two seconds until the decision settles,
+up to poll_deadline. On the deadline, or if the ticket cannot be fetched at
+all, it reports the outcome as unknown and stops.
 
-When the broker refuses the request outright — a gate failure, a 404, or
-either 409 — nothing was touched, so the refusal is reported directly and
+When the broker refuses the request outright — a gate failure, a 404, a 413,
+or either 409 — nothing was touched, so the refusal is reported directly and
 nothing is polled.
 
-Approval executes synchronously inside the POST, so a 200 from approve is
-always terminal. A 200 carrying "approved" or "executing" cannot occur.
+Settled is not terminal.                                    *mcp-buff-settled*
 
-Terminal states are executed, failed, indeterminate, denied and expired.
+Each source declares both, and the difference is why:
+
+- Cloudflare's approval executes synchronously inside the POST, so a 200 from
+  approve is always terminal and the two sets are identical. Its terminal
+  states are executed, failed, indeterminate, denied and expired.
+- The Git broker's approval only unlocks a token, so a successful approve
+  leaves the ticket approved: settled, because the decision landed, but not
+  terminal, because the push it licenses has not happened. A client that
+  polled for a terminal state here would sit out its whole deadline on a
+  decision that succeeded immediately, and then report an unknown outcome for
+  a ticket it had just approved. Its terminal states are consumed, denied and
+  expired.
+
+A 200 carrying a status this release has never heard of is not an answer
+either way, so it is resolved by polling. A client that cannot name a status
+cannot claim to know what it means.
 
 indeterminate                                        *mcp-buff-indeterminate*
 
-indeterminate means the outcome is genuinely unknown: a mutation may or may
-not have reached Cloudflare. It is rendered as its own group, never as a
-failure, and it is not a retry signal. Inspect it upstream; never replay the
-ticket.
+A Cloudflare-only state. indeterminate means the outcome is genuinely
+unknown: a mutation may or may not have reached Cloudflare. It is rendered as
+its own group, never as a failure, and it is not a retry signal. Inspect it
+upstream; never replay the ticket.
 
 Errors you will see                                          *mcp-buff-errors*
 
 The four transport gates have distinct statuses and share one ordered
-middleware chain: Origin (403), Host (400), bearer (401), then content type
-(415) on POSTs only. A status names the first gate that failed, not the worst
-thing wrong with the request, so a bad Host masks a missing capability and
-answers 400 rather than 401. Fix them in that order.
+middleware chain on both brokers: Origin (403), Host (400), bearer (401),
+then content type (415) on POSTs only. A status names the first gate that
+failed, not the worst thing wrong with the request, so a bad Host masks a
+missing capability and answers 400 rather than 401. Fix them in that order.
 
 A 400 carrying "invalid host" is a configuration fault — an asymmetric
 forward. It is never a retryable body error, and it must not prompt you to
-resubmit a decision.
+resubmit a decision. The remedy names that broker's own port.
 
 Both 409s share a status and are separated only by their message text: one is
 a digest mismatch, the other is a state transition that is no longer legal,
 which after a pending render means the ticket expired or was decided while you
 were reviewing.
 
-A 500 on a decision may be nothing worse than a note over the broker's 32kb
-body cap, so it is treated as an unknown outcome and polled.
-
-An off-route request returns HTML rather than JSON. McpBuff decodes error
-bodies defensively and reports this as a wrong route, not as a JSON error.
-
 A terminal ticket is unlinked once it is past the broker's retention window
 and then 404s. Listing tickets is what expires the overdue and prunes the
-aged, so the list itself is not a pure read.
+aged, on both brokers, so a list itself is not a pure read.
+
+Three wire facts differ between the brokers.           *mcp-buff-divergences*
+They are carried by each source rather than branched on, so a message is
+accurate for the broker that actually answered:
+
+- A body over the 32kb cap answers 500 on Cloudflare, which is an unknown
+  outcome and is polled; the GitHub broker answers 413, which is definitive
+  and decided nothing.
+- An off-route request returns HTML on Cloudflare, from Express's
+  finalhandler, and JSON on the GitHub broker, from its admin handler's own
+  404. McpBuff decodes error bodies defensively on both, because "every
+  non-2xx carries {"error":...}" is true of neither.
+- A refused digest means no Cloudflare request was sent, or on the GitHub
+  broker that no token was minted and no push is licensed.
 
 ==============================================================================
-9. CONFIGURATION                                             *mcp-buff-config*
+10. CONFIGURATION                                            *mcp-buff-config*
 
 Default configuration: >lua
 
     require("mcp_buff").setup({
+      -- The unprefixed keys configure the Cloudflare broker. They predate
+      -- the second provider and are kept as they were.
       endpoint = "http://127.0.0.1:8792",
       capability_cmd = nil,     -- required; argv list, run with no shell
-      capability_ttl = 300,     -- seconds the value is held in memory
-      curl_command = "curl",
-      timeout = 30000,          -- milliseconds; reads only
-      decision_timeout = 1865,  -- seconds; the approve/deny POST
-      poll_deadline = 1865,     -- seconds; outcome polling after a failed POST
-      refresh_interval = 0,     -- seconds; automatic refresh is off
-      host_header = nil,        -- e.g. "127.0.0.1:8792" for an asymmetric forward
+      host_header = nil,        -- e.g. "127.0.0.1:8792" if asymmetric
       tunnel = false,           -- or { host = "broker-ssh-alias" }
-      permissions = {
-        cloudflare = {},        -- inherits the main Cloudflare session
-        github = {
-          endpoint = "http://127.0.0.1:8793",
-          capability_cmd = nil, -- distinct GitHub admin capability
-          tunnel = false,
-        },
+
+      -- The GitHub broker: one connection, serving its tickets and its
+      -- permissions both.
+      github = {
+        endpoint = "http://127.0.0.1:8793",
+        capability_cmd = nil,   -- a separate GitHub admin capability
+        host_header = nil,
+        tunnel = false,         -- never inherited between brokers
+        permissions = true,     -- false hides this tab's permissions
       },
+
+      -- Inherited by any broker that sets none of its own.
+      curl_command = "curl",
+      capability_ttl = 300,     -- seconds each value is held in memory
+      timeout = 30000,          -- milliseconds; reads only
+      decision_timeout = nil,   -- seconds; per-broker default when unset
+      poll_deadline = nil,      -- seconds; per-broker default when unset
+
+      -- Panel-wide.
+      refresh_interval = 0,     -- seconds; automatic refresh is off
     })
 <
-endpoint must use the exact shape http://127.0.0.1:PORT. Remote, bridge,
+Every endpoint must use the exact shape http://127.0.0.1:PORT. Remote, bridge,
 HTTPS, path-bearing, and credential-bearing values are rejected.
+
+Set cloudflare = { ... } instead of the unprefixed keys if you prefer both
+brokers named. Configuring one broker both ways is an error rather than a
+merge, because there is no way to tell which endpoint was meant. Set either
+provider to false to drop its tab. An unknown top-level key is rejected: a
+silently ignored typo in a security surface is how an endpoint ends up
+somewhere nobody intended.
+
+permissions = { cloudflare = ..., github = ... } is the previous spelling of
+this option, from when the permissions panel was the only place a second
+broker appeared. It is still accepted and mapped, not reinterpreted:
+permissions.github configured that broker's connection, so that is what it
+still configures. permissions.cloudflare accepted only {} or false, and false
+now hides the Cloudflare tab's permissions section.
+
+Nothing is inherited between brokers except values that identify neither: the
+curl binary, the timeouts, and the TTL. endpoint, capability_cmd, host_header,
+and tunnel are never inherited, because inheriting any of them would point a
+broker at its sibling's socket or send it its sibling's bearer.
 
 timeout applies to reads only. A read performs no execution, so a read that
 hangs for half an hour is a broken tunnel, not a long approval.
 
-decision_timeout applies to the approve and deny POST, and is clamped to
-65..86400 seconds. Approval performs every preflight GET and every mutation
-inside that one request: up to ten requests, each incurring two preflight GETs
-and a mutation, each individually timed at the broker's own 60s default. The
-worst case is far longer than a conventional HTTP timeout, which is why the
-default is 1865 rather than 30.
+decision_timeout applies to the approve and deny POST and is clamped to
+65..86400 seconds. Its sensible value is a property of the broker rather than
+of the panel, so each source supplies its own default:
+
+- Cloudflare, 1865. Approval performs every preflight GET and every mutation
+  inside that one request: up to ten requests, each incurring two preflight
+  GETs and a mutation, each individually timed at the broker's own 60s
+  default. The worst case is far longer than a conventional HTTP timeout.
+- Git, 120. Nothing executes inside the POST; the broker writes one small
+  file and renames it.
+
+Setting decision_timeout or poll_deadline explicitly overrides both.
 
 Neither timeout bounds your review time. That is bounded only by the ticket's
 expiry, which the detail view always shows.
 
 poll_deadline bounds the outcome polling described in |mcp-buff-outcomes| and
-is clamped to the same range.
+is clamped to the same range. Its default is 1865 for Cloudflare and 300 for
+Git.
 
 A positive whole refresh_interval enables the optional background timer, which
-never runs capability_cmd; see |mcp-buff-no-prompts|. Manual r remains
-available. In managed mode, the timer runs only while the panel is visible and
-never reopens a route after the panel closes.
+never runs capability_cmd and never opens a forward; see
+|mcp-buff-no-prompts|. Manual r remains available. The timer refreshes the
+visible tab only, and in managed mode runs only while the panel is visible.
 
 host_header overrides the Host header for an asymmetric forward; see
 |mcp-buff-symmetric|. Making the forward symmetric is preferred.
@@ -363,58 +559,67 @@ host_header overrides the Host header for an asymmetric forward; see
 tunnel enables the optional panel-scoped SSH lifecycle. host is required and
 must be an SSH alias or hostname without whitespace. ssh_command defaults to
 "ssh", and startup_timeout defaults to 30000 milliseconds and accepts
-1000..120000. Unknown keys are rejected. The endpoint port supplies both sides
-of the symmetric loopback forward.
-
-permissions.cloudflare is {} by default and inherits the main Cloudflare
-endpoint, capability, and tunnel. It may be false to hide that provider.
-
-permissions.github defaults to endpoint http://127.0.0.1:8793 and has no
-capability_cmd or tunnel. Supply its own capability_cmd and, when desired, its
-own managed tunnel. It may be false to hide GitHub. The two provider
-capabilities are never shared.
+1000..120000. Unknown keys are rejected. That broker's endpoint port supplies
+both sides of the symmetric loopback forward.
 
 ==============================================================================
-10. LUA API                                                        *mcp-buff-api*
+11. LUA API                                                        *mcp-buff-api*
 
 The module is returned by: >lua
 
     local buff = require("mcp_buff")
-    buff.setup({ capability_cmd = { "pass", "show", "entry" } })
-    buff.open()
-    buff.open_permissions()
-    buff.refresh()
-    buff.pending_count()
+    buff.setup({
+      capability_cmd = { "pass", "show", "cloudflare-entry" },
+      github = { capability_cmd = { "pass", "show", "github-entry" } },
+    })
+    buff.open()                     -- the active tab
+    buff.open("github")             -- straight to one broker's tab
+    buff.open_permissions("github") -- and onto its permissions section
+    buff.select_tab("github")       -- or buff.select_tab(2)
+    buff.cycle_tab(1)               -- next tab; -1 for previous
+    buff.refresh()                  -- the visible tab only
+    buff.pending_count()            -- every broker
+    buff.pending_count("github")    -- one of them
     buff.close()
 <
-pending_count() is nonblocking and returns the latest cached count. It returns
-0 before the first successful refresh. This makes it safe for statuslines.
+pending_count() is nonblocking and returns the latest cached count across
+every broker, which is what a statusline wants: whether work is waiting does
+not depend on which tab happens to be open. It returns 0 before the first
+successful refresh, and a tab you have never visited contributes 0.
 
 ==============================================================================
-11. SECURITY                                                  *mcp-buff-security*
+12. SECURITY                                                  *mcp-buff-security*
 
-McpBuff speaks only the loopback broker admin API through curl. Curl user
-configuration and redirects are disabled, the endpoint is syntactically
+McpBuff speaks only the loopback broker admin APIs through curl. Curl user
+configuration and redirects are disabled, every endpoint is syntactically
 restricted to IPv4 loopback, and no shell is involved anywhere, including the
 capability fetch and managed SSH launch.
 
 The capability is the only secret in play, and it travels on the private
-channel: a curl configuration file on standard input. The decision body is not
-secret — it carries the digest and an optional note — and travels through
-ordinary process arguments. Note that process arguments are visible to other
-processes running as your user, so do not type anything into a denial note
-that you would not put in `ps` output.
+channel: a curl configuration file on standard input. It is validated and
+used, never republished on the public config table. Each broker owns a
+separate capability cache object; see |mcp-buff-capability-isolation|.
+
+The decision body is not secret — it carries the digest and an optional note —
+and travels through ordinary process arguments. Note that process arguments
+are visible to other processes running as your user, so do not type anything
+into a denial note that you would not put in `ps` output.
 
 Panel and detail buffers are nofile with swap files and undo files disabled,
-so ticket bodies and Cloudflare responses do not reach swap, undo, or log
-files. The plugin persists nothing.
+so ticket bodies and broker responses do not reach swap, undo, or log files.
+The plugin persists nothing.
+
+A request shape this release cannot name is shown in full and labelled, never
+described as a shape it resembles; see |mcp-buff-scopes|. The background timer
+can neither read a credential nor open an SSH route, and never touches a
+broker whose tab is not visible.
 
 McpBuff has no GitHub or Cloudflare API client, no zemRip dependency, and
 nowhere to configure a provider token. Permission updates contain only the
-current state digest and a subset of IDs advertised by that same provider;
-GitHub and Cloudflare capabilities remain in isolated caches. Never weaken a
-broker, expose its admin listener, or move a capability somewhere more
-convenient in order to restore compatibility with an older client.
+current state digest and a subset of IDs advertised by that same provider,
+bound to the socket it was read from. Never weaken a broker, expose its admin
+listener, or move a capability somewhere more convenient in order to restore
+compatibility with an older client.
 
 Managed mode creates a symmetric loopback-only forward, disables SSH control
 multiplexing for exact process ownership, and refuses to reuse an existing
@@ -423,19 +628,35 @@ Managed mode closes its route with the review session; external mode leaves
 that responsibility to the operator.
 
 ==============================================================================
-12. DEVELOPMENT                                            *mcp-buff-development*
+13. DEVELOPMENT                                            *mcp-buff-development*
 
 Linux is tested on Neovim 0.10, 0.11, and 0.12. macOS is smoke-tested on
-Neovim 0.12. The dependency-free Node stub in scripts/stub-admin-server.js
-implements the hardened admin contract — the four gates in order, strict
-decision and permission schemas, digest binding, synchronous terminal
-approval, lazy expiry, retention pruning, HTML off-route bodies, and the
-32kb-to-500 behaviour — so the headless suite exercises the real contract over
-real curl. No test reaches a broker host or provider.
+Neovim 0.12.
+
+The headless suite starts two dependency-free Node stubs on ephemeral loopback
+ports, with two different capabilities, because two brokers is the thing under
+test — a single stub could not catch a client that reused one socket's bearer
+on the other.
+
+scripts/stub-admin-server.js implements the Cloudflare admin contract: the
+four gates in order, strict decision and permission schemas, digest binding,
+synchronous terminal approval, lazy expiry, retention pruning, HTML off-route
+bodies, and the 32kb-to-500 behaviour.
+
+scripts/stub-git-admin-server.js is its sibling and deliberately not a copy.
+Its value is entirely in the places the two diverge — the git digest domain,
+an approve that returns a non-terminal "approved", 413 for an oversized body,
+and a JSON 404 off-route — plus this broker's own ticket shape and state
+machine, and a fixture whose request carries a term the workflow-push shape
+does not declare.
+
+Both are driven over real curl, and no test reaches a broker host or provider.
 
 The canonical JSON test vectors are copied verbatim from the broker's own
 suite. If the two implementations ever disagree, the unit tests fail before
-anything can be submitted.
+anything can be submitted. The unit suite also adds a scope to the GitHub
+registry the way a future release would, and asserts that nothing outside that
+module has to change for it to be listed, described, and confirmed.
 
 Development branches start from and merge into bluff. Tested releases promote
 bluff into bet.

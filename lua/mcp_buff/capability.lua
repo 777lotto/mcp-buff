@@ -69,15 +69,36 @@ function M.new(initial)
   -- drops the reference rather than pretending to overwrite the bytes.
   local cached_value
   local cached_until
+  -- Callbacks waiting on a fetch that is already running. A provider tab reads
+  -- its ticket list and its permission document at the same moment, and both
+  -- need the same bearer: without this, one keystroke would run capability_cmd
+  -- twice and raise two pinentry prompts for one credential. Every queued
+  -- waiter is answered by the single fetch, which began after a clear and is
+  -- therefore as fresh as one of its own would have been.
+  local waiters = nil
 
   function instance.clear()
     cached_value = nil
     cached_until = nil
   end
 
+  local function settle(err, value)
+    local queued = waiters
+    waiters = nil
+    for _, callback in ipairs(queued or {}) do callback(err, value) end
+  end
+
   function instance.configure(opts)
     opts = opts or {}
     instance.clear()
+    -- A reconfiguration invalidates a fetch in flight. Its waiters are answered
+    -- as a failure rather than with a value read under the old configuration.
+    if waiters then
+      settle({
+        kind = 'capability',
+        message = 'the capability source was reconfigured while it was being read',
+      })
+    end
     config.cmd = opts.cmd
     config.ttl = opts.ttl or DEFAULT_TTL_SECONDS
     config.fetch_timeout = opts.fetch_timeout or DEFAULT_FETCH_TIMEOUT_MS
@@ -111,6 +132,11 @@ function M.new(initial)
       return callback(nil, cached_value)
     end
 
+    if waiters then
+      waiters[#waiters + 1] = callback
+      return nil
+    end
+
     instance.clear()
 
     if opts.allow_fetch == false then
@@ -122,6 +148,7 @@ function M.new(initial)
       })
     end
 
+    waiters = { callback }
     local spawn = config.spawn or vim.system
     local ok, job_or_error = pcall(spawn, config.cmd, {
       text = true,
@@ -135,7 +162,7 @@ function M.new(initial)
           if detail == '' then
             detail = 'capability_cmd exited with code ' .. tostring(result.code)
           end
-          return callback({
+          return settle({
             kind = 'capability',
             message = 'the admin capability could not be read: ' .. detail,
           })
@@ -143,7 +170,7 @@ function M.new(initial)
 
         local value = trim((result.stdout or ''):match('^[^\r\n]*') or '')
         if not is_capability(value) then
-          return callback({
+          return settle({
             kind = 'capability',
             message = 'capability_cmd did not print 64 lowercase hex characters',
           })
@@ -151,13 +178,13 @@ function M.new(initial)
 
         cached_value = value
         cached_until = monotonic_seconds() + config.ttl
-        callback(nil, cached_value)
+        settle(nil, cached_value)
       end)
     end)
 
     if not ok then
       vim.schedule(function()
-        callback({
+        settle({
           kind = 'capability',
           message = 'capability_cmd could not be started: ' .. one_line(job_or_error),
         })

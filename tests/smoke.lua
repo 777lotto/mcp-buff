@@ -8,17 +8,32 @@ local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':p:h:h')
 local canonical = require('mcp_buff.canonical')
 local capability_module = require('mcp_buff.capability')
 local client_module = require('mcp_buff.client')
+local cloudflare_source = require('mcp_buff.sources.cloudflare')
+local github_source = require('mcp_buff.sources.github')
 
 local stub
+local git_stub
 local panel
-local permissions_panel
 local endpoint
+local git_endpoint
 local ids
+local git_ids
 local workspace
 local capability_counter
+local git_capability_counter
 local capability_cmd
+local git_capability_cmd
+-- Separate capability instances for the suite's own ad-hoc clients, reading the
+-- same secrets through their own counters. The panel's counters then measure
+-- only what the panel did, which is what every "read exactly once" assertion
+-- below is about.
+local probe_capability
+local git_probe_capability
 
 local CAPABILITY = string.rep('a1b2c3d4', 8)
+-- A different capability for the different socket. Reusing one would let a bug
+-- that crossed the two brokers' bearers pass this suite.
+local GIT_CAPABILITY = string.rep('9f8e7d6c', 8)
 
 local function contains(text, needle, message)
   assert(text:find(needle, 1, true), message or ('expected text to contain %q'):format(needle))
@@ -75,12 +90,26 @@ local function stats()
   return vim.json.decode(body)
 end
 
-local function capability_reads()
-  local handle = io.open(capability_counter, 'r')
+local function git_stats()
+  local status, body = raw({ git_endpoint .. '/__stats' })
+  equal(status, 200)
+  return vim.json.decode(body)
+end
+
+local function count_reads(path)
+  local handle = io.open(path, 'r')
   if not handle then return 0 end
   local text = handle:read('*a')
   handle:close()
   return #text
+end
+
+local function capability_reads()
+  return count_reads(capability_counter)
+end
+
+local function git_capability_reads()
+  return count_reads(git_capability_counter)
 end
 
 local function async(call)
@@ -98,7 +127,27 @@ local function admin_client(overrides)
     timeout = 5000,
     decision_timeout = 65,
     poll_deadline = 65,
+    capability = probe_capability,
   }, overrides or {}))
+end
+
+--- A client for the GitHub broker, with its own source and its own capability.
+local function git_client(overrides)
+  return client_module.new(vim.tbl_extend('force', {
+    source = github_source,
+    endpoint = git_endpoint,
+    timeout = 5000,
+    decision_timeout = 65,
+    poll_deadline = 65,
+    capability = git_probe_capability,
+  }, overrides or {}))
+end
+
+local function tab(id)
+  for _, entry in ipairs(panel.tabs) do
+    if entry.id == id then return entry end
+  end
+  error('no such panel tab: ' .. tostring(id))
 end
 
 local function panel_text()
@@ -130,42 +179,55 @@ end
 
 -- ---------------------------------------------------------------------------
 
-local function start_stub()
-  assert(vim.fn.executable('node') == 1, 'node is required for the stub admin server')
+local function wait_ready(base, what)
+  wait_for(function()
+    local result = vim.system({
+      'curl', '--disable', '--silent', '--fail', '--noproxy', '*',
+      '--max-time', '1', base .. '/health',
+    }, { text = true }):wait()
+    return result.code == 0
+  end, what .. ' did not become ready')
+end
+
+--- Two stubs on two ports with two capabilities, because two brokers is the
+--- thing under test. A single stub could not catch a client that reused one
+--- socket's bearer on the other.
+local function start_stubs()
+  assert(vim.fn.executable('node') == 1, 'node is required for the stub admin servers')
   assert(vim.fn.executable('curl') == 1, 'curl is required for the client smoke test')
   local port = unused_port()
   endpoint = 'http://127.0.0.1:' .. port
   stub = vim.system({
     'node', root .. '/scripts/stub-admin-server.js', tostring(port), CAPABILITY,
   }, { text = true })
-
-  wait_for(function()
-    local result = vim.system({
-      'curl', '--disable', '--silent', '--fail', '--noproxy', '*',
-      '--max-time', '1', endpoint .. '/health',
-    }, { text = true }):wait()
-    return result.code == 0
-  end, 'stub admin server did not become ready')
+  wait_ready(endpoint, 'stub admin server')
   ids = stats().ids
+
+  local git_port = unused_port()
+  git_endpoint = 'http://127.0.0.1:' .. git_port
+  git_stub = vim.system({
+    'node', root .. '/scripts/stub-git-admin-server.js', tostring(git_port), GIT_CAPABILITY,
+  }, { text = true })
+  wait_ready(git_endpoint, 'stub git admin server')
+  git_ids = git_stats().ids
 end
 
 --- A capability_cmd that behaves like the real thing: an external command,
 --- run with no shell, whose output never touches argv, the environment, or a
---- file the plugin writes.
-local function install_capability_cmd()
-  workspace = vim.fn.tempname()
-  vim.fn.mkdir(workspace, 'p')
-  capability_counter = workspace .. '/reads'
-  local secret_path = workspace .. '/capability'
-  write_file(secret_path, CAPABILITY .. '\n')
-  local script = workspace .. '/fetch-capability.sh'
+--- file the plugin writes. Each read is counted, so the suite can prove that a
+--- credential is decrypted once per operator decision and not once per request.
+local function install_capability_cmd(name, secret)
+  local counter = workspace .. '/' .. name .. '-reads'
+  local secret_path = workspace .. '/' .. name .. '-capability'
+  write_file(secret_path, secret .. '\n')
+  local script = workspace .. '/fetch-' .. name .. '.sh'
   write_file(script, table.concat({
     '#!/bin/sh',
-    'printf x >> "' .. capability_counter .. '"',
+    'printf x >> "' .. counter .. '"',
     'cat "' .. secret_path .. '"',
     '',
   }, '\n'))
-  return { 'sh', script }
+  return { 'sh', script }, counter
 end
 
 local function test_panel_lists_every_state()
@@ -173,16 +235,28 @@ local function test_panel_lists_every_state()
     return panel_text():find(ids.approve, 1, true) ~= nil
   end, 'ticket list did not render the stub response')
   local text = panel_text()
-  contains(text, 'Pending  (2)')
+  contains(text, 'Tickets · Pending  (2)')
   -- indeterminate is surfaced as its own state, never bucketed with failed.
-  contains(text, 'Indeterminate  (1)')
-  contains(text, 'Failed  (0)')
-  contains(text, 'Executed  (1)')
+  contains(text, 'Tickets · Indeterminate  (1)')
+  contains(text, 'Tickets · Failed  (0)')
+  contains(text, 'Tickets · Executed  (1)')
   -- The overdue pending ticket was expired lazily by the read itself.
-  contains(text, 'Expired  (1)')
-  equal(panel.pending_count(), 2, 'pending_count did not use the refreshed cache')
-  -- One capability read has served the whole session so far.
+  contains(text, 'Tickets · Expired  (1)')
+  equal(panel.pending_count('cloudflare'), 2,
+    'pending_count did not use the refreshed cache')
+  -- One capability read has served the whole session so far, and it served the
+  -- ticket list and the permission document both.
   equal(capability_reads(), 1, 'the capability was read more than once')
+
+  -- The Git tab exists and is on the bar, but nothing has been read from it:
+  -- opening the panel must not reach a second broker or read a second
+  -- credential.
+  contains(text, '▸ 1 Cloudflare 2')
+  contains(text, '2 Git')
+  equal(tab('github').visited, false, 'opening the panel visited both brokers')
+  equal(git_capability_reads(), 0, 'opening the panel read the GitHub capability')
+  equal(git_stats().ticket_list_requests, 0,
+    'opening the panel listed tickets on a broker the operator was not looking at')
 end
 
 local function test_listing_prunes_past_retention()
@@ -197,7 +271,7 @@ end
 local function test_detail_renders_the_reviewable_payload()
   focus(ids.approve)
   panel.primary()
-  local detail_name = 'mcpbuff://ticket/' .. ids.approve
+  local detail_name = 'mcpbuff://cloudflare/ticket/' .. ids.approve
   wait_for(function() return find_buffer(detail_name) ~= nil end,
     'ticket detail buffer did not open')
   local buffer = assert(find_buffer(detail_name))
@@ -225,7 +299,7 @@ local function test_recomputed_digest_matches_the_served_one()
   assert(not err, vim.inspect(err))
   -- The stub computes ticket_sha256 with the broker's own canonicalJson; this
   -- proves the Lua encoder agrees with it over a live payload.
-  local verified, reason = canonical.verify(ticket)
+  local verified, reason = canonical.verify(ticket, cloudflare_source.digest_prefix)
   equal(verified, true, 'digest recomputation disagreed: ' .. tostring(reason))
   equal(#ticket.ticket_sha256, 64)
 end
@@ -281,12 +355,15 @@ end
 local function test_wrong_capability_is_a_bearer_failure()
   local wrong = workspace .. '/wrong-capability.sh'
   write_file(wrong, '#!/bin/sh\nprintf %s ' .. string.rep('f', 64) .. '\n')
-  capability_module.configure({ cmd = { 'sh', wrong }, ttl = 300 })
-  local err = async(function(done) admin_client():get(ids.approve, done) end)
+  -- Missing, malformed, and merely wrong capabilities are indistinguishable
+  -- here, by design.
+  local err = async(function(done)
+    admin_client({
+      capability = capability_module.new({ cmd = { 'sh', wrong }, ttl = 300 }),
+    }):get(ids.approve, done)
+  end)
   equal(err.kind, 'gate_bearer')
   equal(err.status, 401)
-  -- Restore the working capability for the remaining tests.
-  capability_module.configure({ cmd = capability_cmd, ttl = 300 })
 end
 
 local function test_only_pending_tickets_are_decidable()
@@ -308,7 +385,7 @@ local function test_only_pending_tickets_are_decidable()
       vim.notify = real_notify
       -- Assert the refusal came from the pending check, not from an empty
       -- cursor position, so the test cannot pass vacuously.
-      contains(table.concat(notices, '\n'), 'ticket is indeterminate, not pending')
+      contains(table.concat(notices, '\n'), 'ticket is indeterminate, which Cloudflare broker cannot decide')
       equal(stats().decision_posts, before, 'a non-pending ticket was submitted')
     end
   end)
@@ -413,23 +490,44 @@ local function test_deny_reads_denial_note()
   equal(info.polled, false, 'a successful decision was needlessly polled')
   -- The note comes back under a different name.
   equal(denied.denial_note, 'a fresh read changed the record')
-  contains(require('mcp_buff.render').detail(denied), 'a fresh read changed the record')
+  contains(require('mcp_buff.render').detail(cloudflare_source, denied),
+    'a fresh read changed the record')
+end
+
+local function configure_panel(overrides)
+  panel.setup(vim.tbl_extend('force', {
+    endpoint = endpoint,
+    capability_cmd = capability_cmd,
+    refresh_interval = 0,
+    timeout = 5000,
+    decision_timeout = 65,
+    poll_deadline = 65,
+    github = {
+      endpoint = git_endpoint,
+      capability_cmd = git_capability_cmd,
+    },
+  }, overrides or {}))
+  -- setup() drops every cached capability and then refreshes the visible tab,
+  -- so wait for that read to land. Otherwise it arrives in the middle of the
+  -- next test and shows up as a spurious extra credential read.
+  if panel.win then
+    wait_for(function()
+      local current = tab('cloudflare')
+      return not current.loading and not current.permissions.loading
+    end, 'the panel did not settle after setup()')
+  end
 end
 
 local function test_background_refresh_never_prompts()
-  panel.setup({
-    endpoint = endpoint,
-    capability_cmd = capability_cmd,
-    refresh_interval = 1,
-    timeout = 5000,
-  })
+  configure_panel({ refresh_interval = 1 })
   -- setup() performs one ordinary refresh of its own, which may legitimately
   -- acquire a capability. The timer is what must not.
   vim.wait(1000)
 
   -- A cold cache plus a running timer is exactly the situation that could turn
-  -- into a credential prompt storm.
-  capability_module.clear()
+  -- into a credential prompt storm. The cache is this broker's own instance,
+  -- not a module-wide one, so that is what has to go cold.
+  tab('cloudflare').broker.capability.clear()
   local before_reads = capability_reads()
   local before_lists = stats().ticket_list_requests
   vim.wait(3500)
@@ -438,74 +536,352 @@ local function test_background_refresh_never_prompts()
     'a background refresh tick ran capability_cmd')
   equal(stats().ticket_list_requests, before_lists,
     'a background tick reached the broker without a capability')
+  -- And no tick touched the provider the operator is not looking at.
+  equal(git_stats().ticket_list_requests, 0,
+    'a background tick read a broker whose tab was never opened')
 
   -- A manual refresh is still allowed to acquire one.
   panel.refresh()
   wait_for(function() return capability_reads() > before_reads end,
     'a manual refresh did not acquire the capability')
-  panel.setup({
-    endpoint = endpoint,
-    capability_cmd = capability_cmd,
-    refresh_interval = 0,
-    timeout = 5000,
-  })
+  configure_panel()
 end
 
-local function test_permissions_panel_narrows_cloudflare_runtime_scope()
+--- Permissions live inside the provider tab now, so the apply target is the
+--- tab rather than whatever row the cursor happened to be on.
+local function test_permissions_section_narrows_cloudflare_runtime_scope()
   local before = stats().permission_posts
-  panel.open_permissions()
-  permissions_panel = require('mcp_buff.permissions')
-  wait_for(function()
-    local provider = permissions_panel.providers[1]
-    return provider and provider.snapshot ~= nil
-  end, 'permissions panel did not render the broker response')
-
-  local cloudflare = permissions_panel.providers[1]
+  local cloudflare = tab('cloudflare')
+  wait_for(function() return cloudflare.permissions.snapshot ~= nil end,
+    'the permissions section did not render the broker response')
   local before_reads = capability_reads()
-  equal(cloudflare.id, 'cloudflare')
-  equal(permissions_panel.providers[2].id, 'github')
-  equal(permissions_panel.providers[2].configured, false)
-  local first = cloudflare.snapshot.permissions[1]
-  equal(first.enabled, true)
+  contains(panel_text(), 'Runtime permissions')
+  contains(panel_text(), 'cf.dns.record.create.v1')
 
+  local first = cloudflare.permissions.snapshot.permissions[1]
+  equal(first.enabled, true)
   local row
-  for line, mapped in pairs(permissions_panel.line_map) do
-    if mapped.provider == cloudflare and mapped.index == 1 then row = line end
+  for line, mapped in pairs(panel.line_map) do
+    if mapped.kind == 'permission' and mapped.tab == cloudflare and mapped.index == 1 then
+      row = line
+    end
   end
   assert(row, 'the first Cloudflare permission was not mapped')
-  vim.api.nvim_set_current_win(permissions_panel.win)
-  vim.api.nvim_win_set_cursor(permissions_panel.win, { row, 0 })
-  permissions_panel.toggle()
-  equal(cloudflare.snapshot.permissions[1].enabled, false)
+  vim.api.nvim_set_current_win(panel.win)
+  vim.api.nvim_win_set_cursor(panel.win, { row, 0 })
+  -- <CR> on a permission row is a local toggle: nothing is sent.
+  panel.primary()
+  equal(cloudflare.permissions.snapshot.permissions[1].enabled, false)
+  equal(stats().permission_posts, before, 'a toggle reached the broker')
+  -- An unapplied edit is marked on the tab bar, where the operator can see it
+  -- from the other tab.
+  local bar_line = vim.api.nvim_buf_get_lines(panel.buf, 1, 2, false)[1]
+  equal(bar_line:match('Cloudflare ?%d*(%*?)'), '*',
+    'an unapplied permission edit was not marked on the tab bar')
 
   local real_input = vim.fn.input
   vim.fn.input = function()
-    return cloudflare.snapshot.permissions_sha256:sub(-8)
+    return cloudflare.permissions.snapshot.permissions_sha256:sub(-8)
   end
-  local ok, err = pcall(permissions_panel.apply)
+  local ok, err = pcall(panel.apply_permissions)
   vim.fn.input = real_input
   if not ok then error(err) end
 
   wait_for(function() return stats().permission_posts == before + 1 end,
     'permission update did not reach the stub')
-  wait_for(function() return not cloudflare.applying end,
+  wait_for(function() return not cloudflare.permissions.applying end,
     'permission update did not settle')
-  equal(cloudflare.snapshot.permissions[1].enabled, false)
-  equal(cloudflare.must_refresh, false)
+  equal(cloudflare.permissions.snapshot.permissions[1].enabled, false)
+  equal(cloudflare.permissions.must_refresh, false)
   equal(capability_reads(), before_reads,
-    'the permissions view did not share the Cloudflare provider capability cache')
+    'the permissions section did not share the tab broker capability cache')
 
   local request_error, snapshot = async(function(done)
-    admin_client({ permission_provider = 'cloudflare' }):get_permissions(done)
+    admin_client():get_permissions(done)
   end)
   assert(not request_error, vim.inspect(request_error))
   equal(snapshot.permissions[1].enabled, false)
-  permissions_panel.close()
+  equal(snapshot.provider, 'cloudflare')
+
+  -- Put it back so the tab is clean for the remaining tests.
+  vim.api.nvim_win_set_cursor(panel.win, { row, 0 })
+  panel.primary()
+  vim.fn.input = function()
+    return cloudflare.permissions.snapshot.permissions_sha256:sub(-8)
+  end
+  pcall(panel.apply_permissions)
+  vim.fn.input = real_input
+  wait_for(function() return not cloudflare.permissions.applying end,
+    'the restoring permission update did not settle')
+end
+
+--- Switching tabs is the only place a second credential is read, and it happens
+--- because the operator asked for it.
+local function test_switching_to_the_git_tab_reads_only_its_own_broker()
+  local cloudflare_reads = capability_reads()
+  panel.select_tab('github')
+  wait_for(function()
+    return panel_text():find(git_ids.approve, 1, true) ~= nil
+      and tab('github').permissions.snapshot ~= nil
+  end, 'the Git tab did not render the git broker response')
+
+  -- One read served both of this tab's surfaces. The ticket list and the
+  -- permission document go out together, and a capability_cmd that needs a
+  -- pinentry must not be asked twice for one keystroke.
+  equal(git_capability_reads(), 1, 'the GitHub capability was not read exactly once')
+  equal(capability_reads(), cloudflare_reads,
+    'switching tabs re-read the Cloudflare capability')
+
+  local text = panel_text()
+  contains(text, '▸ 2 Git 3')
+  -- This broker's own state names, not Cloudflare's.
+  contains(text, 'Tickets · Pending  (3)')
+  contains(text, 'Tickets · Approved · unspent  (1)')
+  contains(text, 'Tickets · Spent  (1)')
+  contains(text, 'Tickets · Expired  (1)')
+  excludes(text, 'Executed', 'a Cloudflare status appeared on the Git tab')
+  excludes(text, 'Indeterminate', 'a Cloudflare status appeared on the Git tab')
+  -- Its own permission registry, on the same tab.
+  contains(text, 'github.workflow.write')
+  excludes(text, 'cf.dns.record.create.v1',
+    'the Cloudflare registry leaked into the Git tab')
+
+  -- pending_count with no argument is the total across brokers, which is what
+  -- a statusline wants: work waiting does not depend on which tab is open.
+  equal(panel.pending_count('github'), 3)
+  equal(panel.pending_count(),
+    panel.pending_count('cloudflare') + panel.pending_count('github'))
+
+  -- The list is the sweep here too: the terminal ticket past retention is gone.
+  excludes(text, git_ids.prunable, 'a pruned git ticket is still listed')
+
+  -- Returning to a visited tab renders what is held; it does not re-read.
+  panel.select_tab('cloudflare')
+  panel.select_tab('github')
+  equal(git_capability_reads(), 1, 'cycling tabs re-read a capability')
+end
+
+local function test_git_digest_is_recomputed_in_its_own_domain()
+  local err, ticket = async(function(done) git_client():get(git_ids.approve, done) end)
+  assert(not err, vim.inspect(err))
+  -- The stub computes ticket_sha256 with the broker's own canonicalJson and the
+  -- git domain separator; this proves the Lua encoder agrees over a live payload.
+  local verified, reason = canonical.verify(ticket, github_source.digest_prefix)
+  equal(verified, true, 'git digest recomputation disagreed: ' .. tostring(reason))
+
+  -- And that the domains are genuinely separate on the wire, not only in the
+  -- unit vectors: the same served digest must not verify as a Cloudflare one.
+  equal(select(1, canonical.verify(ticket, cloudflare_source.digest_prefix)), false,
+    'a git digest verified in the Cloudflare domain')
+end
+
+--- The GitHub broker diverges from its sibling in four observable places. Each
+--- one is a thing a client author would otherwise carry over and get wrong.
+local function test_git_broker_divergences()
+  local function git_bearer()
+    return { '--header', 'Authorization: Bearer ' .. GIT_CAPABILITY }
+  end
+
+  -- 1. The capabilities are not interchangeable. The Cloudflare bearer on this
+  -- socket is an ordinary 401.
+  local crossed = raw(vim.list_extend(bearer(), { git_endpoint .. '/tickets' }))
+  equal(crossed, 401, 'the Cloudflare capability authenticated the GitHub broker')
+
+  -- 2. An off-route request answers JSON here. The sibling has no catch-all and
+  -- falls through to Express's HTML finalhandler, so a client must not assume
+  -- either shape.
+  local off_status, off_body = raw(vim.list_extend(git_bearer(),
+    { git_endpoint .. '/nope' }))
+  equal(off_status, 404)
+  equal(select(2, client_module.decode_body(off_body)), 'json')
+  contains(off_body, 'no such route')
+
+  -- 3. An oversized body is 413 here and 500 on the sibling, and only one of
+  -- those is definitive.
+  local oversize = vim.json.encode({
+    ticket_sha256 = string.rep('0', 64),
+    note = string.rep('z', 40000),
+  })
+  local big_status, big_body = raw(vim.list_extend(git_bearer(), {
+    '--request', 'POST',
+    '--header', 'Content-Type: application/json',
+    '--data-raw', oversize,
+    git_endpoint .. '/tickets/' .. git_ids.deny .. '/deny',
+  }))
+  equal(big_status, 413, 'an oversized body did not answer 413')
+  contains(big_body, 'request body too large')
+  equal(client_module.classify(413, big_body, 'decision', github_source.http).kind,
+    'body_too_large')
+
+  -- 4. The gates and their precedence are unchanged, and that is worth proving
+  -- rather than assuming: the second socket is a second implementation.
+  local origin_status = raw(vim.list_extend(
+    { '--header', 'Origin: http://example.invalid' },
+    vim.list_extend(git_bearer(), { git_endpoint .. '/tickets' })))
+  equal(origin_status, 403)
+  local host_status = raw({ '--header', 'Host: 127.0.0.1:9999', git_endpoint .. '/tickets' })
+  equal(host_status, 400, 'the Host gate did not take precedence over the bearer gate')
+  local ct_status = raw(vim.list_extend(git_bearer(), {
+    '--request', 'POST', git_endpoint .. '/tickets/' .. git_ids.deny .. '/approve',
+  }))
+  equal(ct_status, 415)
+end
+
+--- The property the whole `settled` distinction exists for, proved on the wire.
+local function test_git_approval_is_settled_without_being_terminal()
+  local before = git_stats().decision_posts
+  local api = git_client()
+  local _, ticket = async(function(done) api:get(git_ids.approve, done) end)
+
+  local err, approved, info = async(function(done)
+    api:decide(git_ids.approve, 'approve',
+      { ticket_sha256 = ticket.ticket_sha256 }, { callback = done })
+  end)
+  assert(not err, vim.inspect(err))
+  -- Approval unlocked a token. Nothing executed, and the ticket still has a
+  -- transition left -- but the decision is answered, so it was not polled.
+  equal(approved.status, 'approved')
+  equal(info.polled, false, 'a settled git approval was needlessly polled')
+  equal(api:is_settled('approved'), true)
+  equal(api:is_terminal('approved'), false)
+  equal(git_stats().decision_posts, before + 1,
+    'the git decision was submitted more than once')
+
+  -- The state machine has no way back: approved cannot be denied, and the
+  -- panel must not offer it.
+  local reversal = async(function(done)
+    api:decide(git_ids.approve, 'deny',
+      { ticket_sha256 = ticket.ticket_sha256, note = 'changed my mind' },
+      { callback = done })
+  end)
+  equal(reversal.kind, 'state_conflict')
+  equal(api:is_decidable('approved'), false)
+end
+
+local function test_git_deny_and_digest_conflicts()
+  local api = git_client()
+  local _, deny_ticket = async(function(done) api:get(git_ids.deny, done) end)
+  local _, other = async(function(done) api:get(git_ids.future, done) end)
+
+  -- A digest copied from another ticket on the same broker is a cross-ticket
+  -- replay, and the refusal says what was not done here rather than repeating
+  -- Cloudflare's sentence.
+  local replay = async(function(done)
+    api:decide(git_ids.deny, 'approve', { ticket_sha256 = other.ticket_sha256 },
+      { callback = done })
+  end)
+  equal(replay.kind, 'digest_conflict')
+  contains(replay.message, 'No token was minted')
+  excludes(replay.message, 'Cloudflare',
+    'the git broker refusal named the wrong provider')
+
+  local err, denied = async(function(done)
+    api:decide(git_ids.deny, 'deny', {
+      ticket_sha256 = deny_ticket.ticket_sha256,
+      note = '  three release workflows is not one reviewable change  ',
+    }, { callback = done })
+  end)
+  assert(not err, vim.inspect(err))
+  equal(denied.status, 'denied')
+  equal(denied.denial_note, 'three release workflows is not one reviewable change')
+  contains(require('mcp_buff.render').detail(github_source, denied),
+    'three release workflows is not one reviewable change')
+end
+
+--- A decision through the panel: the typed digest is what authorises it, and a
+--- git ticket is confirmed against the git digest domain.
+---
+--- The ticket decided here is deliberately the unrecognised-scope one. Refusing
+--- to decide a scope this release cannot name would leave the operator with no
+--- review surface at all for a broker newer than the panel, which is worse than
+--- deciding one whose whole request record was shown and whose digest verified.
+local function test_git_typed_confirmation_gates_the_decision()
+  panel.select_tab('github')
+  panel.refresh()
+  wait_for(function() return find_line(git_ids.future) ~= nil end,
+    'the Git tab did not refresh')
+  local before = git_stats().decision_posts
+  local cloudflare_before = stats().decision_posts
+
+  local answer
+  local real_input = vim.fn.input
+  vim.fn.input = function() return answer end
+  local ok, err = pcall(function()
+    focus(git_ids.future)
+    -- A wrong suffix must submit nothing at all.
+    answer = 'deadbeef'
+    panel.approve()
+    vim.wait(400)
+    equal(git_stats().decision_posts, before,
+      'a mistyped digest still submitted a git decision')
+
+    local _, ticket = async(function(done) git_client():get(git_ids.future, done) end)
+    answer = ticket.ticket_sha256:sub(-8)
+    focus(git_ids.future)
+    panel.approve()
+    wait_for(function()
+      local _, current = async(function(done) git_client():get(git_ids.future, done) end)
+      return current and current.status == 'approved'
+    end, 'the git approval did not settle')
+  end)
+  vim.fn.input = real_input
+  if not ok then error(err) end
+
+  equal(git_stats().decision_posts, before + 1,
+    'the git decision was submitted more than once')
+  -- The Cloudflare broker saw none of this. One panel, two sockets, and a
+  -- decision only ever reaches the broker whose tab it was taken on.
+  equal(stats().decision_posts, cloudflare_before,
+    'a git decision reached the Cloudflare broker')
+end
+
+--- An unrecognised scope is still decidable -- refusing would leave the
+--- operator with no surface at all for a scope newer than the panel -- but the
+--- panel must never describe it as a scope it knows.
+local function test_unrecognised_scope_is_shown_not_guessed()
+  panel.select_tab('github')
+  panel.refresh()
+  wait_for(function() return find_line(git_ids.approve) ~= nil end,
+    'the Git tab did not refresh')
+  local err, ticket = async(function(done) git_client():get(git_ids.future, done) end)
+  assert(not err, vim.inspect(err))
+  local detail = require('mcp_buff.render').detail(github_source, ticket)
+  contains(detail, 'Unrecognised scope')
+  contains(detail, 'does not recognise this request shape')
+  -- The extra term is on screen, not folded into the shape it nearly matched.
+  contains(detail, '"branch_protection": "disable"')
+  excludes(detail, 'Workflow-changing push',
+    'a request with an unreviewed term was described as an ordinary push')
+end
+
+--- :McpBuffPermissions is an existing command in operators' keymaps. It now
+--- lands on the permissions section of a provider tab.
+local function test_permissions_command_jumps_into_a_tab()
+  panel.open_permissions('cloudflare')
+  equal(panel.active, 'cloudflare')
+  local item = panel.line_map[vim.api.nvim_win_get_cursor(panel.win)[1]]
+  assert(item and item.kind == 'permission' and item.index == 1,
+    'the permissions command did not land on a permission row')
+  equal(item.tab.id, 'cloudflare')
+
+  panel.open_permissions('github')
+  equal(panel.active, 'github')
+  local git_item = panel.line_map[vim.api.nvim_win_get_cursor(panel.win)[1]]
+  assert(git_item and git_item.kind == 'permission', 'no GitHub permission row')
+  equal(git_item.tab.id, 'github')
 end
 
 local function run()
-  start_stub()
-  capability_cmd = install_capability_cmd()
+  workspace = vim.fn.tempname()
+  vim.fn.mkdir(workspace, 'p')
+  start_stubs()
+  capability_cmd, capability_counter = install_capability_cmd('cloudflare', CAPABILITY)
+  git_capability_cmd, git_capability_counter =
+    install_capability_cmd('github', GIT_CAPABILITY)
+  probe_capability = capability_module.new({
+    cmd = (install_capability_cmd('cloudflare-probe', CAPABILITY)), ttl = 300 })
+  git_probe_capability = capability_module.new({
+    cmd = (install_capability_cmd('github-probe', GIT_CAPABILITY)), ttl = 300 })
 
   assert(vim.fn.exists(':McpBuff') == 2, ':McpBuff command was not registered')
   assert(vim.fn.exists(':McpBuffPermissions') == 2,
@@ -518,6 +894,10 @@ local function run()
     timeout = 5000,
     decision_timeout = 65,
     poll_deadline = 65,
+    github = {
+      endpoint = git_endpoint,
+      capability_cmd = git_capability_cmd,
+    },
   })
   panel.open()
 
@@ -532,16 +912,26 @@ local function run()
   test_approve_returns_a_terminal_ticket()
   test_digest_and_state_conflicts_are_distinguished()
   test_deny_reads_denial_note()
+  test_permissions_section_narrows_cloudflare_runtime_scope()
   test_background_refresh_never_prompts()
-  test_permissions_panel_narrows_cloudflare_runtime_scope()
+
+  test_switching_to_the_git_tab_reads_only_its_own_broker()
+  test_git_digest_is_recomputed_in_its_own_domain()
+  test_git_broker_divergences()
+  test_git_approval_is_settled_without_being_terminal()
+  test_git_deny_and_digest_conflicts()
+  test_unrecognised_scope_is_shown_not_guessed()
+  test_git_typed_confirmation_gates_the_decision()
+  test_permissions_command_jumps_into_a_tab()
 end
 
 local ok, message = xpcall(run, debug.traceback)
 if panel then pcall(panel.close) end
-if permissions_panel then pcall(permissions_panel.close) end
-if stub then
-  pcall(function() stub:kill(15) end)
-  pcall(function() stub:wait(1000) end)
+for _, process in ipairs({ stub, git_stub }) do
+  if process then
+    pcall(function() process:kill(15) end)
+    pcall(function() process:wait(1000) end)
+  end
 end
 if workspace then pcall(vim.fn.delete, workspace, 'rf') end
 if not ok then error(message) end
