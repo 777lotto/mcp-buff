@@ -324,7 +324,8 @@ float has no permission rows to act on.
 There is one detail window and it is reused. Opening another ticket, or
 deciding the one on screen, replaces its contents; a decision therefore leaves
 the settled ticket in front of you rather than stacking a second float on top
-of the payload you just approved.
+of the payload you just approved. Long prose wraps at word boundaries inside
+the float, and continued lines retain a readable indent.
 
 Closing the panel during an in-flight decision or permission update keeps that
 broker's owned route alive until the result is accounted for, then closes it.

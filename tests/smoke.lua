@@ -301,6 +301,7 @@ local function test_detail_renders_the_reviewable_payload()
   wait_for(function() return find_buffer(detail_name) ~= nil end,
     'ticket detail buffer did not open')
   local buffer = assert(find_buffer(detail_name))
+  local float = vim.api.nvim_get_current_win()
   local detail = table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), '\n')
 
   contains(detail, 'full approval reason from the stub admin server')
@@ -317,6 +318,9 @@ local function test_detail_renders_the_reviewable_payload()
   equal(vim.api.nvim_get_option_value('buftype', { buf = panel.buf }), 'nofile')
   equal(vim.api.nvim_get_option_value('swapfile', { buf = panel.buf }), false)
   equal(vim.api.nvim_get_option_value('undofile', { buf = panel.buf }), false)
+  equal(vim.api.nvim_get_option_value('wrap', { win = float }), true)
+  equal(vim.api.nvim_get_option_value('linebreak', { win = float }), true)
+  equal(vim.api.nvim_get_option_value('breakindent', { win = float }), true)
   vim.api.nvim_buf_delete(buffer, { force = true })
 end
 
