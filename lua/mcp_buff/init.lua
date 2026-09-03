@@ -8,9 +8,15 @@
 --
 -- Two brokers, two state machines, two digest domains. Nothing in this file
 -- knows which is which: it asks the tab's source module. What it does enforce,
--- for every tab equally, is the review contract -- a fresh read before a
--- decision, a locally recomputed digest, the full payload on screen, and a
--- typed confirmation with no default answer and no single-keypress path.
+-- for every tab equally, is the review contract -- a fresh read before every
+-- decision, a digest recomputed locally in that broker's own domain, and the
+-- whole payload rendered on screen before anything is sent.
+--
+-- Those are the panel's checks to run, so the decision itself is one keystroke,
+-- taken from the list or from inside the preview of the very payload it
+-- decides. What a review contract cannot be built out of is the operator's
+-- patience: a confirmation retyped on every ticket is one that gets typed
+-- without being read.
 
 local api, fn, uv = vim.api, vim.fn, (vim.uv or vim.loop)
 local broker_module = require('mcp_buff.broker')
@@ -122,6 +128,38 @@ end
 
 local function notify(message, level)
   vim.notify('McpBuff: ' .. message, level or vim.log.levels.INFO)
+end
+
+-- ---------------------------------------------------------------------------
+-- The preview float
+-- ---------------------------------------------------------------------------
+
+-- One preview window, reused for every ticket the panel opens.
+--
+-- It is not a passive viewer. A decision is taken from inside it -- `a` and
+-- `d` are mapped there too, because reading the payload and deciding it are
+-- one act, and a review surface the operator has to leave before they can act
+-- is a review surface they stop opening.
+--
+-- Reused rather than stacked for the same reason: a decision opens the payload
+-- it is about to submit and then the settled ticket, so one keystroke would
+-- otherwise bury the panel under a pile of floats, and a decision taken in a
+-- float would be ambiguous about which of the visible tickets it meant.
+local preview = { win = nil, buf = nil, tab = nil, ticket = nil }
+
+local function preview_visible()
+  return preview.win ~= nil and api.nvim_win_is_valid(preview.win)
+end
+
+--- Whether the cursor is in the preview, which is what makes the ticket it
+--- shows -- and not the row behind it -- the target of a decision.
+local function preview_focused()
+  return preview_visible() and api.nvim_get_current_win() == preview.win
+end
+
+local function close_preview()
+  if preview_visible() then pcall(api.nvim_win_close, preview.win, true) end
+  preview.win, preview.buf, preview.tab, preview.ticket = nil, nil, nil, nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -273,6 +311,10 @@ function M.select_tab(target)
   end
   local tab = index and M.tabs[index]
   if not tab then return end
+  -- The preview belongs to the tab it was opened from. Leaving one broker's
+  -- ticket floating over another broker's tab would put a decidable payload in
+  -- front of the operator with the wrong tab bar behind it.
+  if tab.id ~= M.active then close_preview() end
   M.active = tab.id
   -- A first visit fetches; a return visit renders what is already held. Cycling
   -- tabs must not re-read a credential each time round.
@@ -295,9 +337,58 @@ function M.previous_tab() M.cycle_tab(-1) end
 -- Ticket detail
 -- ---------------------------------------------------------------------------
 
+local function float_config(tab, ticket, height)
+  local width = math.max(20, math.min(110, vim.o.columns - 4))
+  height = math.max(4, math.min(height, vim.o.lines - 4))
+  return {
+    relative = 'editor',
+    border = 'rounded',
+    title = (' %s · %s '):format(tab.source.title, tostring(ticket.id)),
+    title_pos = 'center',
+    width = width,
+    height = height,
+    row = math.max(1, math.floor((vim.o.lines - height) / 2) - 1),
+    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+  }
+end
+
+--- The keys the preview answers to.
+---
+--- Deliberately the ticket half of the panel's map, not all of it: a decision
+--- and a refresh act on something the float is showing or on the tab behind it,
+--- while the permission keys act on a row the float has none of. `q` closes the
+--- preview here; the panel's `q` closes the panel.
+local function attach_preview_keys(buf)
+  local function map(lhs, callback, description)
+    vim.keymap.set('n', lhs, callback, {
+      buffer = buf,
+      nowait = true,
+      silent = true,
+      desc = 'McpBuff: ' .. description,
+    })
+  end
+  for _, key in ipairs({ 'q', '<Esc>' }) do
+    map(key, function() close_preview() end, 'close ticket detail')
+  end
+  map('a', function() M.approve() end, 'approve the previewed ticket')
+  map('d', function() M.deny() end, 'deny the previewed ticket')
+  for _, key in ipairs({ '<CR>', '<NL>', '<kEnter>' }) do
+    map(key, function() M.primary() end, 're-read the previewed ticket')
+  end
+  map('r', function() M.refresh() end, 'refresh this tab')
+  map('<Tab>', function() M.cycle_tab(1) end, 'next broker tab')
+  map('<S-Tab>', function() M.previous_tab() end, 'previous broker tab')
+  for index = 1, #M.tabs do
+    local target = index
+    map(tostring(target), function() M.select_tab(target) end,
+      'open the ' .. M.tabs[target].label .. ' tab')
+  end
+end
+
 local function show_detail(tab, ticket)
   local text = render.detail(tab.source, ticket)
   local lines = vim.split(text, '\n', { plain = true })
+  local outgoing = preview.buf
   local buf = api.nvim_create_buf(false, true)
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   api.nvim_set_option_value('buftype', 'nofile', { buf = buf })
@@ -306,35 +397,38 @@ local function show_detail(tab, ticket)
   api.nvim_set_option_value('undofile', false, { buf = buf })
   api.nvim_set_option_value('modifiable', false, { buf = buf })
   api.nvim_set_option_value('filetype', 'markdown', { buf = buf })
+  attach_preview_keys(buf)
+
+  local config = float_config(tab, ticket, #lines)
+  if preview_visible() then
+    -- Into the window that is already open, so the ticket the operator can see
+    -- and the ticket their next keystroke decides are always the same one. The
+    -- cursor follows it there, exactly as it follows a newly opened float: a
+    -- ticket put on screen for review is one the operator is meant to be in.
+    api.nvim_win_set_buf(preview.win, buf)
+    api.nvim_win_set_config(preview.win, config)
+    api.nvim_set_current_win(preview.win)
+  else
+    config.style = 'minimal'
+    preview.win = api.nvim_open_win(buf, true, config)
+  end
+  api.nvim_set_option_value('wrap', false, { win = preview.win })
+
+  -- Naming comes last, after the buffer this one replaced is gone. The two are
+  -- the same ticket whenever a decision re-renders one, and a name still held
+  -- by the outgoing buffer would leave this one anonymous.
+  if outgoing and outgoing ~= buf and api.nvim_buf_is_valid(outgoing) then
+    pcall(api.nvim_buf_delete, outgoing, { force = true })
+  end
   -- Namespaced by provider: two brokers mint ids from the same pattern, and a
   -- buffer name that could collide would show one broker's ticket under the
   -- other's heading.
   pcall(api.nvim_buf_set_name, buf,
     ('mcpbuff://%s/ticket/%s'):format(tab.id, tostring(ticket.id)))
-
-  local width = math.max(20, math.min(110, vim.o.columns - 4))
-  local height = math.max(4, math.min(#lines, vim.o.lines - 4))
-  local window = api.nvim_open_win(buf, true, {
-    relative = 'editor',
-    style = 'minimal',
-    border = 'rounded',
-    title = (' %s · %s '):format(tab.source.title, tostring(ticket.id)),
-    title_pos = 'center',
-    width = width,
-    height = height,
-    row = math.max(1, math.floor((vim.o.lines - height) / 2) - 1),
-    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
-  })
-  api.nvim_set_option_value('wrap', false, { win = window })
-  for _, key in ipairs({ 'q', '<Esc>' }) do
-    vim.keymap.set('n', key, '<cmd>close<cr>', {
-      buffer = buf,
-      nowait = true,
-      silent = true,
-      desc = 'Close MCP ticket detail',
-    })
-  end
-  return buf, window
+  preview.buf = buf
+  preview.tab = tab
+  preview.ticket = ticket
+  return buf, preview.win
 end
 
 local function current_item()
@@ -343,7 +437,16 @@ local function current_item()
   return M.line_map[api.nvim_win_get_cursor(window)[1]]
 end
 
+--- The ticket a keystroke acts on.
+---
+--- The preview wins whenever the cursor is inside it, because a ticket the
+--- operator is reading is the one they mean, and the panel row behind the float
+--- is not something they can see. Everywhere else the cursor row is the target,
+--- exactly as before.
 local function current_ticket()
+  if preview_focused() and preview.tab then
+    return preview.tab, preview.ticket
+  end
   local item = current_item()
   if item and item.kind == 'ticket' then return item.tab, item.ticket end
   return nil
@@ -370,15 +473,6 @@ end
 -- ---------------------------------------------------------------------------
 -- Decisions
 -- ---------------------------------------------------------------------------
-
-local function typed_confirmation(tab, ticket, action)
-  fn.inputsave()
-  local ok, answer = pcall(fn.input, render.confirm_prompt(tab.source, ticket, action))
-  fn.inputrestore()
-  vim.cmd('redraw')
-  if not ok then return false end
-  return trim(answer) == render.digest_suffix(ticket)
-end
 
 local function report_decision(tab, action, decided, info, show)
   upsert_ticket(tab, decided)
@@ -407,10 +501,6 @@ end
 local function submit_decision(tab, ticket, action, note)
   if tab.decision_active then
     return notify('a decision is already in progress for this tab', vim.log.levels.WARN)
-  end
-  if not typed_confirmation(tab, ticket, action) then
-    return notify(('%s cancelled; the typed digest did not match'):format(action),
-      vim.log.levels.WARN)
   end
   tab.broker:ensure(function(transport_error)
     if transport_error then
@@ -447,9 +537,15 @@ local function submit_decision(tab, ticket, action, note)
   end)
 end
 
--- Both decisions take the same route: a fresh read, a decidability check, a
--- local digest recomputation in this broker's own digest domain, a full render,
--- then a typed confirmation.
+-- Both decisions take the same route, and every step of it is the panel's own
+-- work rather than the operator's: a fresh read of the ticket, a decidability
+-- check, a local digest recomputation in this broker's own digest domain, and
+-- the full payload rendered into the preview -- which is left on screen, so the
+-- ticket that was submitted is the one still in front of the operator.
+--
+-- The keystroke itself is the confirmation. There is no digest to retype: the
+-- panel verifies the digest it recomputed against the one the broker served,
+-- which is the check a typed suffix was only ever an unreliable proxy for.
 local function decide(action)
   local tab = current_ticket()
   if tab and tab.decision_active then
@@ -541,9 +637,16 @@ end
 --- <CR> means "do the obvious thing to the row under the cursor": read a
 --- ticket, or flip a permission. Neither is destructive, and both are the only
 --- sensible reading of their own row.
+---
+--- Inside the preview it re-reads the ticket on screen. The permission branch
+--- is skipped there on purpose: the float shows a ticket, and a keystroke that
+--- silently toggled a permission row hidden behind it would be acting on
+--- something the operator cannot see.
 function M.primary()
-  local item = current_item()
-  if item and item.kind == 'permission' then return M.toggle_permission() end
+  if not preview_focused() then
+    local item = current_item()
+    if item and item.kind == 'permission' then return M.toggle_permission() end
+  end
   fetch_current(function(tab, ticket) show_detail(tab, ticket) end)
 end
 
@@ -573,6 +676,7 @@ end
 
 end_session = function(force)
   local released = true
+  close_preview()
   for _, tab in ipairs(M.tabs) do
     tab.generation = tab.generation + 1
     tab.loading = false
@@ -584,6 +688,9 @@ end
 
 function M.close()
   local deferred = busy()
+  -- Before the window arithmetic below, not after: a float left open would
+  -- both count as a window and be the only one left if the panel closed first.
+  close_preview()
   local window = find_window()
   if window then
     local last_window = #api.nvim_tabpage_list_wins(api.nvim_win_get_tabpage(window)) == 1

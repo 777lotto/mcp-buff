@@ -840,8 +840,8 @@ local function test_a_new_scope_needs_only_its_own_entry()
     contains(detail, 'Repository settings change')
     contains(detail, '**allow_squash_merge:** `false`')
     excludes(detail, 'Unrecognised scope')
-    contains(render.confirm_prompt(github, ticket, 'approve'),
-      'step 0 · Repository settings change · 777lotto/zemrip · allow_squash_merge → false')
+    contains(detail,
+      'Step 0 · Repository settings change · 777lotto/zemrip · allow_squash_merge → false')
     assert(canonical.ticket_digest(ticket, GIT) ~= nil,
       'a new scope broke digest recomputation')
 
@@ -888,41 +888,46 @@ local function test_decision_reporting_levels()
   end
 end
 
-local function test_typed_confirmation()
-  equal(render.digest_suffix(DETAIL_TICKET), 'a41b7e3d')
-  local prompt = render.confirm_prompt(cloudflare, DETAIL_TICKET, 'approve')
-  contains(prompt, 'ticket_sha256: ' .. DETAIL_TICKET.ticket_sha256)
-  contains(prompt, 'Type the final digest bytes a41b7e3d to approve: ')
-  -- A yes/no prompt does not satisfy the contract, so no affirmative default
-  -- may appear anywhere in the confirmation surface.
-  excludes(prompt, '&Approve')
-  excludes(prompt, '(y/n)')
+--- The decision is a keystroke, so the detail window is the whole of the
+--- confirmation surface. Everything the old typed prompt carried has to be in
+--- it: which broker, what the word "approve" means on that broker, one line per
+--- step naming the grant, and the complete digest.
+local function test_the_detail_is_the_confirmation_surface()
+  local pending = vim.tbl_extend('force', DETAIL_TICKET, { status = 'pending' })
+  local detail = render.detail(cloudflare, pending)
+  contains(detail, 'Cloudflare broker')
+  -- The complete digest, never an abbreviation of it. Nothing asks the operator
+  -- to reproduce it, and a truncated one could not be compared against the
+  -- broker's own record either.
+  contains(detail, pending.ticket_sha256)
+  contains(detail, 'executed inside the approval POST itself')
+  contains(detail, 'Step 0 · Cloudflare API mutation · PATCH /zones/example-zone')
+  -- The keys that decide, on the window that shows the terms.
+  contains(detail, '`a` approves and `d` denies')
+  contains(detail, 'a` approve · `d` deny')
 
-  -- Which broker, and what its approval actually does. The two mean different
-  -- things by the word, and that difference has to be on screen at the moment
-  -- the keystroke becomes irrevocable.
-  contains(prompt, 'Cloudflare broker')
-  contains(prompt, 'executed inside the approval POST itself')
-  local git_prompt = render.confirm_prompt(github, GIT_TICKET, 'approve')
-  contains(git_prompt, 'GitHub broker')
-  contains(git_prompt, 'no immediate action')
-  contains(git_prompt, 'step 0 · Workflow-changing push · 777lotto/zemrip · 2 refs')
-  contains(git_prompt, 'Type the final digest bytes d00dfeed to approve: ')
+  local git_detail = render.detail(github, GIT_TICKET)
+  contains(git_detail, 'GitHub broker')
+  contains(git_detail, 'no immediate action')
+  contains(git_detail, 'Step 0 · Workflow-changing push · 777lotto/zemrip · 2 refs')
 
   -- Denial says what it does not do, on both brokers.
-  contains(render.confirm_prompt(cloudflare, DETAIL_TICKET, 'deny'),
-    'no mutation is sent')
-  contains(render.confirm_prompt(github, GIT_TICKET, 'deny'),
-    'no token is ever minted')
+  contains(render.detail(cloudflare, pending), 'no mutation is sent')
+  contains(git_detail, 'no token is ever minted')
 
-  -- A scope this release cannot name says so here, not only in the detail
-  -- buffer: this line is the last thing read before the decision.
-  local unknown_prompt = render.confirm_prompt(github,
+  -- A scope this release cannot name says so in the heading of its own step,
+  -- not only in the body underneath it.
+  local unknown = render.detail(github,
     vim.tbl_extend('force', GIT_TICKET, {
       requests = { { repo = 'a/b', refs = { 'r' }, branch_protection = 'disable' } },
-    }), 'approve')
-  contains(unknown_prompt, 'Unrecognised scope')
-  contains(unknown_prompt, 'not recognised by this release')
+    }))
+  contains(unknown, 'Step 0 · Unrecognised scope · scope not recognised by this release')
+
+  -- A decided ticket offers no decision, so it must not advertise the keys that
+  -- would take one.
+  local decided = render.detail(cloudflare, DETAIL_TICKET)
+  excludes(decided, '`a` approves and `d` denies')
+  contains(decided, 'Press `q` or `<Esc>` to close.')
 end
 
 local function test_decision_timeout_bounds()
@@ -1659,7 +1664,7 @@ test_git_detail_rendering()
 test_scope_matching_is_total()
 test_a_new_scope_needs_only_its_own_entry()
 test_decision_reporting_levels()
-test_typed_confirmation()
+test_the_detail_is_the_confirmation_surface()
 test_decision_timeout_bounds()
 test_broker_normalization()
 test_brokers_never_share_a_capability()

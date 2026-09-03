@@ -305,16 +305,26 @@ The following mappings are local to the panel buffer:
 <CR>            On a ticket row, re-fetch and open the full detail. On a
                 permission row, toggle it locally. LF and keypad Enter
                 perform the same action.
-a               Re-fetch, review, and approve a decidable ticket after typing
-                the digest confirmation.
-d               Re-fetch, review, and deny a decidable ticket with an
-                optional note after typing the digest confirmation.
+a               Re-fetch and verify a decidable ticket, show the payload,
+                and approve it. Nothing further is asked for.
+d               The same, and deny it with an optional note.
 <Space>         Toggle a runtime permission locally.
 A               Apply this tab's permission changes after typing the state
                 digest confirmation.
 r               Refresh this tab.
-q               Close the panel and every managed tunnel. In detail, q or
-                <Esc> closes the float.
+q               Close the panel and every managed tunnel. In the detail
+                window, q or <Esc> closes the float instead.
+
+The detail window is a review surface, not a modal.         *mcp-buff-preview*
+a, d, r, <CR>, <Tab>, <S-Tab> and 1 .. N all work inside it. A decision taken
+there acts on the ticket the window is showing, whatever the panel cursor sits
+on underneath it, and the permission keys are deliberately absent because the
+float has no permission rows to act on.
+
+There is one detail window and it is reused. Opening another ticket, or
+deciding the one on screen, replaces its contents; a decision therefore leaves
+the settled ticket in front of you rather than stacking a second float on top
+of the payload you just approved.
 
 Closing the panel during an in-flight decision or permission update keeps that
 broker's owned route alive until the result is accounted for, then closes it.
@@ -329,7 +339,8 @@ expired. Anything else is grouped per |mcp-buff-unknown-status|. Rows show
 age, the complete ticket ID, and a reason excerpt.
 
 <CR> opens the full reason, the expiry, the complete ticket_sha256, what
-approval authorises, and every reviewable term of every stored request. For
+approval authorises, one line per step naming the grant, and every reviewable
+term of every stored request. For
 Cloudflare that is each method, literal path and pretty-printed JSON body,
 each request's structured precondition, every preflight observation, and every
 result. For Git it is the repository and every ref in the licensed set.
@@ -349,7 +360,7 @@ five immutable fields on both brokers. Only the domain prefix differs: >
 <
 That difference is load-bearing.                       *mcp-buff-digest-domain*
 The two brokers hold different powers and are reviewed in the same panel. A
-shared prefix would make a digest you typed for a Cloudflare ticket a valid
+shared prefix would make a digest reviewed for a Cloudflare ticket a valid
 digest for a git ticket carrying an identical immutable payload — exactly the
 cross-ticket replay the digest exists to stop. Different power, different
 domain separator. Nothing in McpBuff defaults the domain: a verification
@@ -368,23 +379,38 @@ immutable fields never change; a ticket approved, denied, or expired between
 your read and your submission keeps an identical digest, and that race is
 caught by the ticket state machine instead.
 
-Typed confirmation                                          *mcp-buff-confirm*
+The decision is a keystroke                                 *mcp-buff-confirm*
 
-After the render, McpBuff requires you to type the final eight characters of
-the digest. The prompt also names the broker and says what the decision
-authorises, because the two brokers mean different things by "approve", and
-one line per step names its scope: >
+a approves and d denies, and neither asks you to retype anything. Every check
+between the keystroke and the broker is McpBuff's own work: the ticket is
+re-read, its status is checked against what that broker can decide, and its
+digest is recomputed in that broker's domain and compared with the served one.
+A suffix typed off the screen proved none of that — only that the digest on
+screen matched itself.
 
-    GitHub broker · t_20260903T090000.000Z_0000000000b1
-    ticket_sha256: fb00f5ea...ab87116d
-    This approve authorises no immediate action. It unlocks that scope for
-    one later push, which is spent before a byte is forwarded and cannot be
-    reused.
-      step 0 · Workflow-changing push · 777lotto/zemrip · 1 ref
-    Type the final digest bytes ab87116d to approve:
+What the keystroke buys is the render, which is why it is the render and not a
+prompt that carries the broker's name, the complete digest, what approval
+authorises on that broker, and one line per step naming the grant: >
+
+    ## What approval does
+
+    Approving this ticket authorises no immediate action. It unlocks that
+    scope for one later push, which is spent before a byte is forwarded and
+    cannot be reused.
+
+    `a` approves and `d` denies, here or in the list. The panel re-reads the
+    ticket and re-verifies this digest first, and asks for nothing else — so
+    the terms above are what you are agreeing to.
+
+    ### Step 0 · Workflow-changing push · 777lotto/zemrip · 1 ref
 <
-There is no single-keypress approval and no yes/no prompt. Anything other than
-the exact suffix cancels, and nothing is sent.
+So a on a list row opens that render and submits, and a inside the render
+submits what you have just read. Denial adds one prompt on purpose: an optional
+note, cancelled with <Esc> and skipped with an empty answer, because a denial
+is the one decision that can carry a reason back to whoever asked.
+
+Either key acts only on a decidable ticket. Anything else is refused with the
+reason and nothing is sent.
 
 The plugin cannot edit a ticket and supplies no requests at approval time.
 

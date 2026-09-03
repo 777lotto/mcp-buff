@@ -94,10 +94,37 @@ Notable changes are recorded here. Releases follow semantic versioning.
   (`mcpbuff://<provider>/ticket/<id>`), and the panel buffer is
   `mcpbuff://review`. Two brokers mint ids from the same pattern, so an
   un-namespaced name could show one broker's ticket under the other's heading.
-- The typed-confirmation prompt now names the broker, says what the decision
-  authorises, and lists one line per step naming its scope. The two brokers
-  mean different things by "approve", and that difference belongs on screen at
-  the moment the keystroke becomes irrevocable.
+- **A ticket decision is now one keystroke.** `a` approves and `d` denies with
+  nothing to retype. Every check that stands between the keystroke and the
+  broker is the panel's own work and is unchanged: the ticket is re-read, its
+  status is checked against what that broker can decide, and its digest is
+  recomputed locally in that broker's domain and compared with the served one.
+  Typing the digest's last eight characters proved none of that — only that the
+  digest on screen matched itself — and a confirmation retyped on every ticket
+  is one that gets typed without being read. Denial still offers its optional
+  note, which is a reason to send back, not a gate. Permission updates still
+  require the typed state digest: that write has no operation id to poll, so
+  its compare-and-swap ceremony is doing different work.
+- **The ticket detail window is a decision surface.** `a`, `d`, `r`, `<CR>`,
+  `<Tab>`, `<S-Tab>` and `1` … `N` all work inside it — previously `a` there
+  began an insert into a read-only buffer — and a decision taken in it acts on
+  the ticket it is showing, whatever the panel cursor sits on underneath. The
+  permission keys are deliberately absent, because the float has no permission
+  rows to act on.
+- **One detail window, reused.** Opening another ticket, or deciding the one on
+  screen, replaces its contents rather than stacking a float on top of a float,
+  so a decision leaves the settled ticket in front of the operator.
+- The detail view now carries what the typed prompt used to: the broker's name,
+  what approval authorises on that broker, and one line per step naming the
+  grant rather than the shape — including a step whose scope this release
+  cannot name. It is the last thing read before the decision, so that is where
+  the difference between the two brokers' idea of "approve" belongs.
+
+### Removed
+
+- `render.confirm_prompt()` and `render.digest_suffix()`, with the typed
+  confirmation they built. Everything they put on screen is now in the detail
+  view, which is the surface the decision is taken from.
 
 ## 2.0.0
 
