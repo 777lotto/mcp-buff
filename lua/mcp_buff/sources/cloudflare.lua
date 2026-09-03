@@ -14,7 +14,6 @@ local M = {
   id = 'cloudflare',
   title = 'Cloudflare broker',
   tab_label = 'Cloudflare',
-  ticket_noun = 'write ticket',
   digest_prefix = canonical.CLOUDFLARE_TICKET_PREFIX,
   default_endpoint = 'http://127.0.0.1:8792',
   permissions_provider = 'cloudflare',

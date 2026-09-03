@@ -30,7 +30,6 @@ local M = {
   id = 'github',
   title = 'GitHub broker',
   tab_label = 'Git',
-  ticket_noun = 'git write ticket',
   digest_prefix = canonical.GIT_TICKET_PREFIX,
   default_endpoint = 'http://127.0.0.1:8793',
   permissions_provider = 'github',
