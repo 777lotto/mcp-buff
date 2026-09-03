@@ -48,6 +48,11 @@ Notable changes are recorded here. Releases follow semantic versioning.
 
 ### Changed
 
+- `bluff` is now the default and only long-lived branch; CI, release
+  notification, and contributor guidance no longer retain the retired `bet`
+  promotion path.
+- Stable releases notify `nvim-config` with the exact tagged commit so its
+  tested lock cannot race ahead to a later branch head.
 - `canonical.verify()`, `ticket_digest()`, and `ticket_preimage()` now require
   an explicit digest domain and refuse without one. A defaulted domain is the
   cross-broker replay the digest exists to stop: the two brokers hold
@@ -173,4 +178,4 @@ one that requires them.
 - Headless compilation, unit, real-HTTP stub, and vimdoc checks across the same
   Neovim matrix as git-panel.nvim.
 
-[Unreleased]: https://github.com/777lotto/mcp-buff/commits/bet
+[Unreleased]: https://github.com/777lotto/mcp-buff/commits/bluff
