@@ -5,12 +5,9 @@ the proposed behavior.
 
 ## Branch model
 
-- `bet` is the production/default branch.
-- `bluff` is the persistent integration branch.
+- `bluff` is the default and only long-lived branch.
 - Short-lived work branches start from and return to `bluff`.
-- A `bluff` → `bet` pull request promotes a tested release candidate.
-
-Do not target `bet` directly for ordinary changes.
+- Releases are signed tags from tested `bluff` commits.
 
 ## Local checks
 
@@ -38,5 +35,9 @@ questions, setup showcases, and exploratory ideas. Open an Issue when work is
 reproducible and actionable.
 
 Human commits should be signed with a GitHub-verified GPG, SSH, or S/MIME
-signature. Approved automation commits may be explicitly unsigned. Open the
-pull request into `bluff`, complete the checklist, and wait for CI.
+signature. Approved automation commits and brokered `zemrip-ai` commits may be
+explicitly unsigned. On the agent plane, pushes are limited to `agent/**`;
+workflow changes also require an operator-approved one-use ticket. The broker
+cannot push `bluff` or tags, publish Releases, or administer repository
+secrets. Open the pull request into `bluff`, complete the checklist, and wait
+for CI.

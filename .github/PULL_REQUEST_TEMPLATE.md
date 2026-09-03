@@ -9,7 +9,7 @@
 
 ## Validation
 
-- [ ] I targeted `bluff`, or this is a `bluff` → `bet` promotion.
+- [ ] I targeted the default `bluff` branch.
 - [ ] Commit provenance is explicit (human commits signed; approved automation may be unsigned).
 - [ ] Lua compilation, focused unit tests, and the stub-admin smoke test pass.
 - [ ] `:help mcp-buff` matches user-visible behavior.
