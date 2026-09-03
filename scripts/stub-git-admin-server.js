@@ -100,6 +100,10 @@ const ids = {
   // does not declare. The client must render it as an unrecognised scope rather
   // than describing it with the shape it nearly matches.
   future: "t_20260903T085500.000Z_0000000000b7",
+  // Pending, and decided from inside the panel's preview window rather than
+  // from the list, so the suite can prove which ticket a keystroke taken there
+  // acts on.
+  preview: "t_20260903T085000.000Z_0000000000b8",
 };
 
 function workflowPush(repo, refs) {
@@ -189,6 +193,13 @@ const seed = [
         branch_protection: "disable",
       },
     ],
+  ),
+  ticket(
+    ids.preview,
+    -7 * MINUTE,
+    2 * HOUR,
+    "add a coverage upload step to the smoke workflow",
+    [workflowPush("777lotto/mcp-buff", ["refs/heads/agent/coverage-upload"])],
   ),
 ];
 

@@ -36,8 +36,9 @@ loopback-only admin API reached over SSH.
   credential prompts.
 - `ticket_sha256` is recomputed locally, in that broker's domain, and
   disagreement is a hard refusal.
-- Typed digest confirmation that says which broker and what the approval does.
-  No single-keypress approval, no yes/no prompt.
+- One keystroke decides, from the list or from inside the preview of the very
+  payload being decided. The digest is verified by the panel, not retyped by
+  you.
 - A decision is never resubmitted: an unaccounted-for POST is resolved by
   polling the same ticket.
 - Cached `pending_count()` across brokers for statusline integrations.
@@ -295,8 +296,8 @@ recoverable; describing it wrongly is not.
 
 An unrecognised scope is still decidable. Its digest still verifies and its
 whole record is still shown, and refusing would leave you with no review
-surface at all for a broker newer than the panel. The confirmation prompt names
-it as unrecognised, at the keystroke.
+surface at all for a broker newer than the panel. The step heading in the
+detail view names it as unrecognised, above the record itself.
 
 ## Runtime permissions
 
@@ -433,15 +434,22 @@ Mappings are local to the panel buffer:
 | `<S-Tab>` | Previous broker tab                                                            |
 | `1` … `N` | Jump to a broker tab                                                           |
 | `<CR>`    | On a ticket, fetch and open it in full; on a permission, toggle it locally     |
-| `a`       | Re-fetch, review, type the digest confirmation, and approve                    |
-| `d`       | Re-fetch, review, type the digest confirmation, and deny with an optional note |
+| `a`       | Re-fetch, verify, show the payload, and approve                                |
+| `d`       | Re-fetch, verify, show the payload, and deny with an optional note             |
 | `<Space>` | Toggle a runtime permission locally                                            |
 | `A`       | Apply this tab's permission changes after typed state-digest confirmation      |
 | `r`       | Refresh this tab                                                               |
 | `q`       | Close the panel and every managed tunnel                                       |
 
 `<NL>` and keypad Enter work like `<CR>`, matching terminal-safe GitPanel
-behavior. Detail windows close with `q` or `<Esc>`.
+behavior.
+
+The detail window is a review surface, not a modal: `a`, `d`, `r`, `<CR>`,
+`<Tab>` and `1` … `N` all work inside it, and `q` or `<Esc>` closes it and
+leaves the panel behind. A decision taken there acts on the ticket the window
+is showing, whatever the panel cursor is sitting on underneath. There is one
+detail window, reused: opening another ticket, or deciding this one, replaces
+its contents rather than stacking a second float on top.
 
 Closing the panel during an in-flight decision or permission update keeps that
 broker's owned route alive until the result is accounted for, then closes it.
@@ -486,7 +494,7 @@ sha256("zemrip.git-ticket.v1" + "\n" + canonicalJson(payload))   # Git
 
 **That difference is load-bearing, not cosmetic.** The two brokers hold
 different powers and are reviewed in the same panel. A shared prefix would make
-a digest the operator typed for a Cloudflare ticket a valid digest for a git
+a digest reviewed for a Cloudflare ticket a valid digest for a git
 ticket carrying an identical immutable payload — exactly the cross-ticket replay
 the digest exists to stop. Different power, different domain separator. Nothing
 in mcp-buff defaults the domain: a verification called without one refuses
@@ -505,24 +513,40 @@ a concurrent decision: the five immutable fields never change, so a ticket
 approved, denied, or expired between your read and your submission keeps an
 identical digest. That race is caught by the ticket state machine instead.
 
-### Typed confirmation
+### The decision is a keystroke
 
-After the render, mcp-buff requires you to type the final eight characters of
-the digest. The prompt also names the broker and says what the decision
-authorises, because the two mean different things by the word "approve", and one
-line per step names its scope:
+`a` approves and `d` denies, and neither asks you to retype anything. Every
+check that stands between the keystroke and the broker is the panel's own work:
+the ticket is re-read, its status is checked against what that broker can
+decide, and its digest is recomputed locally in that broker's domain and
+compared with the served one. A suffix typed from the screen could not have
+proved any of that — it proved only that the digest on screen matched itself.
+
+What replaces the prompt is the render it used to sit under. The detail window
+carries the broker's name, the complete digest, what approval authorises **on
+that broker**, and one line per step naming the grant rather than the shape:
 
 ```text
-GitHub broker · t_20260903T090000.000Z_0000000000b1
-ticket_sha256: fb00f5ea…ab87116d
-This approve authorises no immediate action. It unlocks that scope for one
-later push, which is spent before a byte is forwarded and cannot be reused.
-  step 0 · Workflow-changing push · 777lotto/zemrip · 1 ref
-Type the final digest bytes ab87116d to approve:
+## What approval does
+
+Approving this ticket authorises no immediate action. It unlocks that scope for
+one later push, which is spent before a byte is forwarded and cannot be reused.
+
+`a` approves and `d` denies, here or in the list. The panel re-reads the ticket
+and re-verifies this digest first, and asks for nothing else — so the terms
+above are what you are agreeing to.
+
+### Step 0 · Workflow-changing push · 777lotto/zemrip · 1 ref
 ```
 
-There is no single-keypress approval and no yes/no prompt. Anything other than
-the exact suffix cancels and nothing is sent.
+So `a` on a list row opens that render and submits, and `a` inside the render
+submits what you have just read. Denial adds one prompt on purpose — an
+optional note, which `<Esc>` cancels and an empty answer skips — because a
+denial is the one decision that can carry a reason back to whoever asked.
+
+A decidable ticket is the only thing either key acts on. Anything else — a
+settled ticket, an expired one, a status this release cannot name — is refused
+with the reason, and nothing is sent.
 
 ### Outcomes
 
@@ -742,7 +766,7 @@ mcp-buff/
 ├── lua/mcp_buff/capability.lua      # in-memory admin capability acquisition
 ├── lua/mcp_buff/permissions.lua     # runtime-permission state and apply
 ├── lua/mcp_buff/tunnel.lua          # optional owned SSH-forward lifecycle
-├── lua/mcp_buff/render.lua          # tab bar, lists, detail, confirmation
+├── lua/mcp_buff/render.lua          # tab bar, lists, ticket detail
 ├── plugin/mcp-buff.lua              # lightweight command registration
 ├── doc/mcp-buff.txt                 # :help mcp-buff
 ├── scripts/check-lua.lua            # dependency-free compilation check

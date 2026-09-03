@@ -171,10 +171,36 @@ local function find_buffer(prefix)
   return nil
 end
 
-local function focus(ticket_id)
+local function point_at(ticket_id)
   local line = assert(find_line(ticket_id), 'ticket row was not mapped: ' .. ticket_id)
-  vim.api.nvim_set_current_win(panel.win)
   vim.api.nvim_win_set_cursor(panel.win, { line, 0 })
+end
+
+local function focus(ticket_id)
+  vim.api.nvim_set_current_win(panel.win)
+  point_at(ticket_id)
+end
+
+--- Run a body with every typed-input path booby-trapped.
+---
+--- A decision must not ask for anything: no digest to retype, no prompt of any
+--- other shape. A prompt raised here fails the test rather than hanging the
+--- suite behind a stub that silently answers it.
+local function without_prompts(body)
+  local real_input, real_ui_input = vim.fn.input, vim.ui.input
+  local prompted
+  vim.fn.input = function(...)
+    prompted = tostring((select(1, ...)))
+    error('the panel asked for typed input: ' .. prompted)
+  end
+  vim.ui.input = function(opts)
+    prompted = tostring(opts and opts.prompt)
+    error('the panel asked for typed input: ' .. prompted)
+  end
+  local ok, err = pcall(body)
+  vim.fn.input, vim.ui.input = real_input, real_ui_input
+  if not ok then error(err) end
+  assert(prompted == nil, 'a decision prompted for ' .. tostring(prompted))
 end
 
 -- ---------------------------------------------------------------------------
@@ -368,55 +394,43 @@ end
 
 local function test_only_pending_tickets_are_decidable()
   local before = stats().decision_posts
-  local real_input = vim.fn.input
   local real_notify = vim.notify
-  -- Set up so that a correct suffix would be typed: the refusal must come from
-  -- the pending check, before the confirmation is ever reached.
-  local _, ticket = async(function(done) admin_client():get(ids.indeterminate, done) end)
-  vim.fn.input = function() return ticket.ticket_sha256:sub(-8) end
 
   local ok, err = pcall(function()
-    for _, action in ipairs({ panel.approve, panel.deny }) do
-      local notices = {}
-      vim.notify = function(message) notices[#notices + 1] = tostring(message) end
-      focus(ids.indeterminate)
-      action()
-      vim.wait(800, function() return #notices > 0 end, 20)
-      vim.notify = real_notify
-      -- Assert the refusal came from the pending check, not from an empty
-      -- cursor position, so the test cannot pass vacuously.
-      contains(table.concat(notices, '\n'), 'ticket is indeterminate, which Cloudflare broker cannot decide')
-      equal(stats().decision_posts, before, 'a non-pending ticket was submitted')
-    end
+    without_prompts(function()
+      for _, action in ipairs({ panel.approve, panel.deny }) do
+        local notices = {}
+        vim.notify = function(message) notices[#notices + 1] = tostring(message) end
+        focus(ids.indeterminate)
+        action()
+        vim.wait(800, function() return #notices > 0 end, 20)
+        vim.notify = real_notify
+        -- Assert the refusal came from the pending check, not from an empty
+        -- cursor position, so the test cannot pass vacuously.
+        contains(table.concat(notices, '\n'),
+          'ticket is indeterminate, which Cloudflare broker cannot decide')
+        equal(stats().decision_posts, before, 'a non-pending ticket was submitted')
+      end
+    end)
   end)
 
-  vim.fn.input = real_input
   vim.notify = real_notify
   if not ok then error(err) end
 end
 
-local function test_typed_confirmation_gates_the_decision()
+--- One keystroke decides, and it asks for nothing.
+---
+--- What authorises the submission is the panel's own work -- a fresh read, the
+--- decidability check, and a digest recomputed locally in this broker's domain
+--- -- not a suffix retyped by the operator. The checks that a typed digest was
+--- a proxy for are asserted directly elsewhere in this suite; what is asserted
+--- here is that nothing is asked for and that the payload is on screen.
+local function test_one_keystroke_decides_without_a_prompt()
   local before = stats().decision_posts
-  local answer
 
-  local real_input = vim.fn.input
-  vim.fn.input = function() return answer end
-
-  local ok, err = pcall(function()
+  without_prompts(function()
     panel.refresh()
     wait_for(function() return find_line(ids.approve) ~= nil end, 'panel did not refresh')
-    focus(ids.approve)
-
-    -- A wrong suffix must submit nothing at all.
-    answer = 'deadbeef'
-    panel.approve()
-    wait_for(function() return true end)
-    vim.wait(300)
-    equal(stats().decision_posts, before, 'a mistyped digest still submitted a decision')
-
-    -- The real suffix, typed in full, is what authorises the submission.
-    local _, ticket = async(function(done) admin_client():get(ids.approve, done) end)
-    answer = ticket.ticket_sha256:sub(-8)
     focus(ids.approve)
     panel.approve()
     wait_for(function()
@@ -425,8 +439,12 @@ local function test_typed_confirmation_gates_the_decision()
     end, 'the approval did not reach a terminal state')
   end)
 
-  vim.fn.input = real_input
-  if not ok then error(err) end
+  -- The ticket that was submitted is left on screen, settled, rather than the
+  -- operator being returned to a list row that says only how it ended.
+  local settled = assert(find_buffer('mcpbuff://cloudflare/ticket/' .. ids.approve),
+    'the decided ticket was not left in the preview')
+  contains(table.concat(vim.api.nvim_buf_get_lines(settled, 0, -1, false), '\n'),
+    '**Status:** executed')
 
   -- Exactly one decision reached the broker: a decision is never resubmitted.
   equal(stats().decision_posts, before + 1, 'the decision was submitted more than once')
@@ -633,9 +651,9 @@ local function test_switching_to_the_git_tab_reads_only_its_own_broker()
     'switching tabs re-read the Cloudflare capability')
 
   local text = panel_text()
-  contains(text, '▸ 2 Git 3')
+  contains(text, '▸ 2 Git 4')
   -- This broker's own state names, not Cloudflare's.
-  contains(text, 'Tickets · Pending  (3)')
+  contains(text, 'Tickets · Pending  (4)')
   contains(text, 'Tickets · Approved · unspent  (1)')
   contains(text, 'Tickets · Spent  (1)')
   contains(text, 'Tickets · Expired  (1)')
@@ -648,7 +666,7 @@ local function test_switching_to_the_git_tab_reads_only_its_own_broker()
 
   -- pending_count with no argument is the total across brokers, which is what
   -- a statusline wants: work waiting does not depend on which tab is open.
-  equal(panel.pending_count('github'), 3)
+  equal(panel.pending_count('github'), 4)
   equal(panel.pending_count(),
     panel.pending_count('cloudflare') + panel.pending_count('github'))
 
@@ -788,14 +806,14 @@ local function test_git_deny_and_digest_conflicts()
     'three release workflows is not one reviewable change')
 end
 
---- A decision through the panel: the typed digest is what authorises it, and a
---- git ticket is confirmed against the git digest domain.
+--- A decision through the panel reaches exactly one broker, and the ticket is
+--- verified against that broker's own digest domain on the way.
 ---
 --- The ticket decided here is deliberately the unrecognised-scope one. Refusing
 --- to decide a scope this release cannot name would leave the operator with no
 --- review surface at all for a broker newer than the panel, which is worse than
 --- deciding one whose whole request record was shown and whose digest verified.
-local function test_git_typed_confirmation_gates_the_decision()
+local function test_a_decision_reaches_only_its_own_broker()
   panel.select_tab('github')
   panel.refresh()
   wait_for(function() return find_line(git_ids.future) ~= nil end,
@@ -803,36 +821,74 @@ local function test_git_typed_confirmation_gates_the_decision()
   local before = git_stats().decision_posts
   local cloudflare_before = stats().decision_posts
 
-  local answer
-  local real_input = vim.fn.input
-  vim.fn.input = function() return answer end
-  local ok, err = pcall(function()
-    focus(git_ids.future)
-    -- A wrong suffix must submit nothing at all.
-    answer = 'deadbeef'
-    panel.approve()
-    vim.wait(400)
-    equal(git_stats().decision_posts, before,
-      'a mistyped digest still submitted a git decision')
-
-    local _, ticket = async(function(done) git_client():get(git_ids.future, done) end)
-    answer = ticket.ticket_sha256:sub(-8)
+  without_prompts(function()
     focus(git_ids.future)
     panel.approve()
     wait_for(function()
       local _, current = async(function(done) git_client():get(git_ids.future, done) end)
       return current and current.status == 'approved'
-    end, 'the git approval did not settle')
+    end, 'the approval did not settle')
   end)
-  vim.fn.input = real_input
-  if not ok then error(err) end
 
   equal(git_stats().decision_posts, before + 1,
-    'the git decision was submitted more than once')
+    'the decision was submitted more than once')
   -- The Cloudflare broker saw none of this. One panel, two sockets, and a
   -- decision only ever reaches the broker whose tab it was taken on.
   equal(stats().decision_posts, cloudflare_before,
-    'a git decision reached the Cloudflare broker')
+    'a Git tab decision reached the Cloudflare broker')
+end
+
+--- The preview is a decision surface, and it decides the ticket it is showing.
+---
+--- Both halves matter. `a` pressed inside the float has to reach the panel at
+--- all -- an unmapped key there used to start an insert into a read-only buffer
+--- -- and it has to act on the payload on screen rather than on whichever row
+--- the cursor was left on underneath it.
+local function test_the_preview_decides_the_ticket_it_shows()
+  panel.select_tab('github')
+  panel.refresh()
+  wait_for(function() return find_line(git_ids.preview) ~= nil end,
+    'the Git tab did not refresh')
+  local before = git_stats().decision_posts
+
+  local detail_name = 'mcpbuff://github/ticket/' .. git_ids.preview
+  focus(git_ids.preview)
+  panel.primary()
+  wait_for(function() return find_buffer(detail_name) ~= nil end,
+    'the preview did not open')
+  local float = vim.api.nvim_get_current_win()
+  equal(vim.api.nvim_win_get_buf(float), find_buffer(detail_name),
+    'the preview did not take the cursor')
+  assert(vim.api.nvim_win_get_config(float).relative ~= '',
+    'the ticket detail is not a float')
+
+  -- The row behind the float is an expired ticket, which the broker cannot
+  -- decide. If the keystroke read the cursor instead of the preview, the
+  -- approval below would be refused rather than submitted.
+  point_at(git_ids.overdue)
+
+  without_prompts(function()
+    vim.api.nvim_feedkeys('a', 'x', false)
+    wait_for(function()
+      local _, current = async(function(done) git_client():get(git_ids.preview, done) end)
+      return current and current.status == 'approved'
+    end, 'a decided the ticket the preview was not showing')
+  end)
+  equal(git_stats().decision_posts, before + 1,
+    'the decision taken in the preview was submitted more than once')
+
+  -- Still one float, showing the settled ticket: a decision replaces the
+  -- preview rather than stacking another window on top of it.
+  equal(vim.api.nvim_get_current_win(), float,
+    'the decision opened a second preview window')
+  contains(table.concat(
+    vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(float), 0, -1, false), '\n'),
+    '**Status:** approved')
+
+  -- q closes the preview and leaves the panel behind, decided row and all.
+  vim.api.nvim_feedkeys('q', 'x', false)
+  assert(not vim.api.nvim_win_is_valid(float), 'q did not close the preview')
+  assert(panel.win and vim.api.nvim_win_is_valid(panel.win), 'q closed the panel')
 end
 
 --- An unrecognised scope is still decidable -- refusing would leave the
@@ -852,6 +908,36 @@ local function test_unrecognised_scope_is_shown_not_guessed()
   contains(detail, '"branch_protection": "disable"')
   excludes(detail, 'Workflow-changing push',
     'a request with an unreviewed term was described as an ordinary push')
+end
+
+--- The preview belongs to the panel, so closing the panel takes it along.
+---
+--- Left behind, it would be a decidable payload floating over whatever the
+--- operator moved on to, with no tab bar behind it and no list to return to.
+--- The float also counts as a window, so the panel's own close arithmetic has
+--- to account for it before it decides whether it is closing the last one.
+local function test_closing_the_panel_takes_the_preview_with_it()
+  panel.select_tab('github')
+  panel.refresh()
+  wait_for(function() return find_line(git_ids.granted) ~= nil end,
+    'the Git tab did not refresh')
+  focus(git_ids.granted)
+  panel.primary()
+  local detail_name = 'mcpbuff://github/ticket/' .. git_ids.granted
+  wait_for(function() return find_buffer(detail_name) ~= nil end,
+    'the preview did not open')
+  local float = vim.api.nvim_get_current_win()
+
+  -- Closed from the panel, not from the float, which is the case that leaves a
+  -- float as the only window if the panel closes first.
+  vim.api.nvim_set_current_win(panel.win)
+  panel.close()
+  assert(not vim.api.nvim_win_is_valid(float),
+    'the preview outlived the panel it belongs to')
+  for _, window in ipairs(vim.api.nvim_list_wins()) do
+    assert(vim.api.nvim_win_get_buf(window) ~= panel.buf,
+      'the panel window is still open')
+  end
 end
 
 --- :McpBuffPermissions is an existing command in operators' keymaps. It now
@@ -908,7 +994,7 @@ local function run()
   test_transport_gates_and_precedence()
   test_wrong_capability_is_a_bearer_failure()
   test_only_pending_tickets_are_decidable()
-  test_typed_confirmation_gates_the_decision()
+  test_one_keystroke_decides_without_a_prompt()
   test_approve_returns_a_terminal_ticket()
   test_digest_and_state_conflicts_are_distinguished()
   test_deny_reads_denial_note()
@@ -921,7 +1007,9 @@ local function run()
   test_git_approval_is_settled_without_being_terminal()
   test_git_deny_and_digest_conflicts()
   test_unrecognised_scope_is_shown_not_guessed()
-  test_git_typed_confirmation_gates_the_decision()
+  test_a_decision_reaches_only_its_own_broker()
+  test_the_preview_decides_the_ticket_it_shows()
+  test_closing_the_panel_takes_the_preview_with_it()
   test_permissions_command_jumps_into_a_tab()
 end
 

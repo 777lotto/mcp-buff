@@ -8,7 +8,7 @@
 -- The preimage differs between brokers in exactly one place: the domain prefix.
 -- That difference is load-bearing rather than cosmetic. The two brokers hold
 -- different powers and are reviewed in the same panel, so a shared prefix would
--- make a digest the operator typed for a Cloudflare ticket a valid digest for a
+-- make a digest reviewed for a Cloudflare ticket a valid digest for a
 -- git ticket carrying the same immutable payload -- the cross-ticket replay the
 -- digest exists to stop. Nothing here defaults the prefix for that reason.
 

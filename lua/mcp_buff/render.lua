@@ -376,7 +376,11 @@ local function request_lines(lines, source, ticket)
   for index, request in ipairs(requests) do
     local scope = sources.match_scope(source, request)
     lines[#lines + 1] = ''
-    lines[#lines + 1] = ('### Step %d · %s'):format(index - 1, scope.title)
+    -- Scope, then the one line that names the grant rather than the shape. A
+    -- scope this release cannot name says so right here, in the heading of the
+    -- step it belongs to.
+    lines[#lines + 1] = ('### Step %d · %s · %s'):format(
+      index - 1, scope.title, one_line(scope.summary(request)))
     lines[#lines + 1] = ''
     scope.render(lines, request, M)
   end
@@ -415,6 +419,13 @@ function M.detail(source, ticket)
       'Approving this ticket authorises ' .. source.approval_grant,
       '',
       'Denying it authorises ' .. source.denial_grant,
+      '',
+      -- The decision is a keystroke, so this window is the last thing read
+      -- before it. Say so here rather than leaving the operator to discover
+      -- that `a` in a detail float is not inert.
+      '`a` approves and `d` denies, here or in the list. The panel re-reads the '
+        .. 'ticket and re-verifies this digest first, and asks for nothing '
+        .. 'else — so the terms above are what you are agreeing to.',
     })
   end
 
@@ -429,51 +440,12 @@ function M.detail(source, ticket)
     lines[#lines + 1] = tostring(ticket.denial_note)
   end
   lines[#lines + 1] = ''
-  lines[#lines + 1] = '_Press `q` or `<Esc>` to close._'
+  if source.decidable[ticket.status] then
+    lines[#lines + 1] = '_`a` approve · `d` deny · `r` refresh · `q` or `<Esc>` close._'
+  else
+    lines[#lines + 1] = '_Press `q` or `<Esc>` to close._'
+  end
   return table.concat(lines, '\n')
-end
-
--- Beyond this many steps the prompt stops being readable, and an unreadable
--- prompt is one the operator scrolls past.
-local PROMPT_STEP_LIMIT = 6
-
---- The typed-confirmation prompt.
----
---- The contract requires the operator to type the digest's final eight
---- characters. A single keypress bound to "approve" does not satisfy it, and
---- neither does a yes/no prompt.
----
---- Two things beyond the digest are here rather than only in the detail buffer.
---- What the decision authorises, because the brokers mean different things by
---- "approve" -- one executes now, one unlocks something later. And one line per
---- step naming its scope, because that is where a scope this release cannot
---- name says so, at the moment the keystroke becomes irrevocable.
-function M.confirm_prompt(source, ticket, action)
-  local digest = tostring(ticket.ticket_sha256 or '')
-  local suffix = digest:sub(-8)
-  local grant = action == 'approve' and source.approval_grant or source.denial_grant
-  local out = {
-    ('%s · %s'):format(source.title, tostring(ticket.id or '?')),
-    'ticket_sha256: ' .. digest,
-    ('This %s authorises %s'):format(action, grant),
-  }
-  local requests = ticket.requests or {}
-  for index = 1, math.min(#requests, PROMPT_STEP_LIMIT) do
-    local request = requests[index]
-    local scope = sources.match_scope(source, request)
-    out[#out + 1] = ('  step %d · %s · %s'):format(
-      index - 1, scope.title, one_line(scope.summary(request)))
-  end
-  if #requests > PROMPT_STEP_LIMIT then
-    out[#out + 1] = ('  … and %d more step(s); read them in the detail view')
-      :format(#requests - PROMPT_STEP_LIMIT)
-  end
-  out[#out + 1] = ('Type the final digest bytes %s to %s: '):format(suffix, action)
-  return table.concat(out, '\n')
-end
-
-function M.digest_suffix(ticket)
-  return tostring(ticket.ticket_sha256 or ''):sub(-8)
 end
 
 return M

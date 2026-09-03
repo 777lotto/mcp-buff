@@ -11,13 +11,13 @@
 -- Two things differ from the Cloudflare source, and both are load-bearing.
 --
 -- The digest domain is `zemrip.git-ticket.v1`, not the Cloudflare prefix, so a
--- digest typed for one broker can never authorise the other.
+-- digest verified for one broker can never authorise the other.
 --
 -- Approval does not execute anything. It unlocks a token that a later push, on
 -- a different connection, may spend -- or may never spend. So `approved` is not
 -- terminal here, an approved-and-unspent ticket is an outstanding grant the
--- operator should be able to see, and the confirmation prompt has to say that
--- the effect happens later.
+-- operator should be able to see, and the review surface has to say that the
+-- effect happens later.
 
 local canonical = require('mcp_buff.canonical')
 local registry = require('mcp_buff.sources')
@@ -126,9 +126,9 @@ M.denial_grant = 'nothing. The ticket becomes terminal and no token is ever '
 --   2. write `render` to put every reviewable term of the grant on screen. The
 --      digest covers the whole request record, so anything left out is
 --      something the operator approved without reading;
---   3. write `summary` for the one line the confirmation prompt shows at the
---      moment of the keystroke. It is the last thing the operator reads before
---      the decision, so it names the grant, not the shape.
+--   3. write `summary` for the one line that heads the step in the detail
+--      window, which is where the operator decides from. It names the grant,
+--      not the shape.
 --
 -- Nothing else in the panel needs to change.
 
