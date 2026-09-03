@@ -1,36 +1,27 @@
--- Loopback curl transport for the hardened mcp-broker admin API.
+-- Loopback curl transport for a hardened broker admin API.
 --
 -- Two rules shape this file. The capability is the only secret, so it travels on
 -- a private channel (a curl config file on stdin) while the non-secret decision
 -- body travels through ordinary argv. And a decision is never resubmitted: if a
 -- decision POST fails, times out, or comes back undecodable, the outcome is
 -- resolved by polling the same ticket, never by sending it again.
+--
+-- One client speaks to one broker. The wire contract -- four transport gates,
+-- strict decision schemas, digest binding, lazy expiry, retention pruning -- is
+-- shared, so this file is shared too. What is NOT shared is the ticket state
+-- machine and the digest domain, and those arrive as a source module
+-- (`mcp_buff.sources.*`) rather than being hardcoded here. The distinction that
+-- forced this is `settled`: Cloudflare's approve executes inside the POST and is
+-- always terminal, while the git broker's approve only unlocks a later push, so
+-- a successful git approval leaves a ticket that is decided but not terminal.
 
 local fn = vim.fn
 local capability_module = require('mcp_buff.capability')
+local sources = require('mcp_buff.sources')
 
 local M = {}
 local Client = {}
 Client.__index = Client
-
-local STATUSES = {
-  pending = true,
-  approved = true,
-  executing = true,
-  executed = true,
-  failed = true,
-  indeterminate = true,
-  denied = true,
-  expired = true,
-}
-
-local TERMINAL_STATUSES = {
-  executed = true,
-  failed = true,
-  indeterminate = true,
-  denied = true,
-  expired = true,
-}
 
 local TICKET_ID = '^t_%d%d%d%d%d%d%d%dT%d%d%d%d%d%d%.%d%d%dZ_[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]$'
 
@@ -61,9 +52,6 @@ function M.clamp_decision_seconds(value, fallback)
   return seconds
 end
 
-function M.is_terminal(status)
-  return TERMINAL_STATUSES[status] == true
-end
 
 --- Decode an admin response body without assuming it is JSON.
 --- Off-route requests reach Express's finalhandler and come back as HTML, and an
@@ -92,9 +80,15 @@ end
 --- with the request. `definitive` marks the failures where the broker refused
 --- before touching the ticket, which are the only ones safe to report without
 --- polling.
-function M.classify(status, body, context)
+--- @param wire table|nil this broker's wire facts (a source's `http` table plus
+--- its admin port): what a refused digest means here, which status an oversized
+--- body produces, and the port the Host gate expects a forward to name. They
+--- are the three things the two brokers genuinely differ on, so they are passed
+--- in rather than branched on.
+function M.classify(status, body, context, wire)
   local decoded, shape = M.decode_body(body)
   local reported = body_error_message(decoded)
+  wire = wire or {}
 
   if status == 403 then
     return {
@@ -110,7 +104,8 @@ function M.classify(status, body, context)
       retryable = false,
       message = 'the broker rejected the request Host (400). The local forward '
         .. 'port must equal the broker admin port, as in '
-        .. 'ssh -L 8792:127.0.0.1:8792, or the Host header must be overridden to '
+        .. ('ssh -L %d:127.0.0.1:%d'):format(wire.port or 8792, wire.port or 8792)
+        .. ', or the Host header must be overridden to '
         .. 'the broker port. This is a configuration fault, not a body error: do '
         .. 'not resubmit a decision to "fix" it.',
     }
@@ -149,6 +144,15 @@ function M.classify(status, body, context)
     }
   end
 
+  if status == 413 then
+    return {
+      kind = 'body_too_large', status = status, definitive = true,
+      message = 'the broker refused the request body as too large (413). It was '
+        .. 'read no further, so nothing was decided; shorten the denial note and '
+        .. 'decide again.',
+    }
+  end
+
   if status == 404 then
     return {
       kind = 'not_found', status = status, definitive = true,
@@ -172,7 +176,8 @@ function M.classify(status, body, context)
       return {
         kind = 'digest_conflict', status = status, definitive = true,
         message = 'the broker refused the digest (409): it does not match the '
-          .. 'reviewed immutable payload. No Cloudflare request was sent.',
+          .. 'reviewed immutable payload. '
+          .. (wire.digest_conflict_note or 'Nothing was executed.'),
       }
     end
     if text:find('cannot transition', 1, true) then
@@ -190,9 +195,10 @@ function M.classify(status, body, context)
 
   if status == 500 then
     local hint = 'the broker returned 500.'
-    if context == 'decision' then
+    if context == 'decision' and wire.oversized_body_is_500 then
       -- A body over the 32kb express.json cap is neither a Zod error nor a
-      -- 400-tagged SyntaxError, so it falls through to a bare 500.
+      -- 400-tagged SyntaxError, so on this broker it falls through to a bare
+      -- 500. Its sibling answers 413 and is classified above.
       hint = hint .. ' On a decision this may be nothing worse than an oversized '
         .. 'note, but the outcome is not known from the status alone.'
     end
@@ -239,25 +245,59 @@ local function default_spawn(command, opts, callback)
   return vim.system(command, opts, callback)
 end
 
+--- One client per broker.
+---
+--- `source` is the module that owns this broker's ticket state machine and
+--- digest domain. It defaults to the Cloudflare source so that an endpoint-only
+--- construction keeps its original meaning, but nothing infers a source from
+--- the endpoint: a client pointed at the wrong port must fail on the wire, not
+--- quietly adopt the state machine of whichever broker answers.
 function Client.new(opts)
   opts = opts or {}
-  local endpoint, endpoint_error = M.normalize_endpoint(opts.endpoint or 'http://127.0.0.1:8792')
+  local source = opts.source or sources.get('cloudflare')
+  local endpoint, endpoint_error = M.normalize_endpoint(
+    opts.endpoint or source.default_endpoint)
   if not endpoint then error('mcp_buff client: ' .. endpoint_error) end
 
+  local statuses = {}
+  for _, status in ipairs(source.status_order) do statuses[status] = true end
+
   return setmetatable({
+    source = source,
+    statuses = statuses,
     endpoint = endpoint,
     curl_command = opts.curl_command or 'curl',
     timeout = math.max(1000, math.floor(tonumber(opts.timeout) or DEFAULT_READ_TIMEOUT_MS)),
-    decision_timeout = M.clamp_decision_seconds(opts.decision_timeout, DEFAULT_DECISION_TIMEOUT_S),
-    poll_deadline = M.clamp_decision_seconds(opts.poll_deadline, DEFAULT_POLL_DEADLINE_S),
+    decision_timeout = M.clamp_decision_seconds(opts.decision_timeout,
+      source.default_decision_timeout or DEFAULT_DECISION_TIMEOUT_S),
+    poll_deadline = M.clamp_decision_seconds(opts.poll_deadline,
+      source.default_poll_deadline or DEFAULT_POLL_DEADLINE_S),
     host_header = opts.host_header,
     spawn = opts.spawn or default_spawn,
     executable = opts.executable or function(command) return fn.executable(command) == 1 end,
     schedule = opts.schedule or vim.schedule,
     defer = opts.defer or function(callback, ms) vim.defer_fn(callback, ms) end,
     capability = opts.capability or capability_module,
-    permission_provider = opts.permission_provider,
+    permission_provider = opts.permission_provider or source.permissions_provider,
   }, Client)
+end
+
+--- Does this status mean the decision has an outcome the operator can read?
+---
+--- This is the predicate the decision path needs, and it is not "terminal".
+--- The git broker's approve returns `approved`, which is settled -- the
+--- decision landed -- while still having a transition left, because the push it
+--- licenses has not happened yet.
+function Client:is_settled(status)
+  return self.source.settled[status] == true
+end
+
+function Client:is_terminal(status)
+  return self.source.terminal[status] == true
+end
+
+function Client:is_decidable(status)
+  return self.source.decidable[status] == true
 end
 
 function Client:_curl_argv(method, path, body, timeout_seconds)
@@ -297,6 +337,13 @@ function Client:_curl_argv(method, path, body, timeout_seconds)
   command[#command + 1] = '--url'
   command[#command + 1] = self.endpoint .. path
   return command
+end
+
+--- Classify a failure with this broker's own wire facts filled in.
+function Client:_classify(status, body, context)
+  return M.classify(status, body, context, vim.tbl_extend('keep',
+    { port = tonumber(self.endpoint:match(':(%d+)$')) },
+    self.source.http or {}))
 end
 
 function Client:_request(method, path, options, callback)
@@ -360,7 +407,7 @@ function Client:_request(method, path, options, callback)
         end
 
         if status < 200 or status >= 300 then
-          return callback(M.classify(status, response_body, options.context))
+          return callback(self:_classify(status, response_body, options.context))
         end
 
         if trim(response_body) == '' then return callback(nil, nil) end
@@ -389,8 +436,12 @@ function Client:list(status, opts, callback)
     callback, opts = opts, {}
   end
   opts = opts or {}
-  if status ~= nil and not STATUSES[status] then
-    return callback({ kind = 'configuration', message = 'unknown ticket status: ' .. tostring(status) })
+  if status ~= nil and not self.statuses[status] then
+    return callback({
+      kind = 'configuration',
+      message = ('%s has no ticket status %s'):format(
+        self.source.title, tostring(status)),
+    })
   end
   local path = '/tickets' .. (status and ('?status=' .. status) or '')
   return self:_request('GET', path, {
@@ -417,11 +468,11 @@ function Client:get(ticket_id, opts, callback)
   }, callback)
 end
 
---- Poll one ticket until it reaches a terminal state.
+--- Poll one ticket until its decision is settled.
 ---
 --- This is the only thing a client may do after a decision POST it cannot
 --- account for. It never sends the decision again.
-function Client:poll_until_terminal(ticket_id, handlers)
+function Client:poll_until_settled(ticket_id, handlers)
   handlers = handlers or {}
   local on_progress = handlers.on_progress or function() end
   local callback = handlers.callback
@@ -439,21 +490,22 @@ function Client:poll_until_terminal(ticket_id, handlers)
             .. 'inspect the ticket. Never resubmit the decision.',
         })
       end
-      if type(ticket) == 'table' and M.is_terminal(ticket.status) then
-        return callback(nil, ticket, { outcome = 'terminal', polled = true })
+      if type(ticket) == 'table' and self:is_settled(ticket.status) then
+        return callback(nil, ticket, { outcome = 'settled', polled = true })
       end
       if waited >= deadline_ms then
         return callback({
           kind = 'unknown_outcome',
           definitive = false,
           ticket = ticket,
-          message = 'the decision did not reach a terminal state within the poll '
-            .. 'deadline. The outcome is unknown; inspect the ticket and never '
-            .. 'resubmit the decision.',
+          message = 'the decision did not settle within the poll deadline. The '
+            .. 'outcome is unknown; inspect the ticket and never resubmit the '
+            .. 'decision.',
         })
       end
       waited = waited + POLL_INTERVAL_MS
-      on_progress(('waiting for a terminal state (%ds)…'):format(math.floor(waited / 1000)))
+      on_progress(('waiting for the decision to settle (%ds)…'):format(
+        math.floor(waited / 1000)))
       self.defer(attempt, POLL_INTERVAL_MS)
     end)
   end
@@ -500,7 +552,7 @@ function Client:decide(ticket_id, action, decision, handlers)
 
   local function resolve_by_polling(reason)
     on_progress(reason .. ' Polling the same ticket; the decision is not resent.')
-    self:poll_until_terminal(ticket_id, { on_progress = on_progress, callback = callback })
+    self:poll_until_settled(ticket_id, { on_progress = on_progress, callback = callback })
   end
 
   self:_request('POST', '/tickets/' .. ticket_id .. '/' .. action, {
@@ -515,13 +567,14 @@ function Client:decide(ticket_id, action, decision, handlers)
     if type(ticket) ~= 'table' or type(ticket.status) ~= 'string' then
       return resolve_by_polling('The broker returned a decision body mcp-buff could not read.')
     end
-    -- Approval executes synchronously, so a 200 is always terminal. A
-    -- non-terminal 200 cannot occur; if one ever does, resolve it by polling
-    -- rather than by guessing.
-    if not M.is_terminal(ticket.status) then
-      return resolve_by_polling(('The broker returned a non-terminal %s.'):format(ticket.status))
+    -- A 200 whose status this source calls settled is the answer. Anything else
+    -- -- a status still open to the decision, or one this release has never
+    -- heard of -- is resolved by polling rather than by guessing, because a
+    -- client that cannot name a status cannot claim to know what it means.
+    if not self:is_settled(ticket.status) then
+      return resolve_by_polling(('The broker returned an unsettled %s.'):format(ticket.status))
     end
-    callback(nil, ticket, { outcome = 'terminal', polled = false })
+    callback(nil, ticket, { outcome = 'settled', polled = false })
   end)
 end
 
@@ -620,8 +673,6 @@ end
 
 M.Client = Client
 M.new = Client.new
-M.statuses = STATUSES
-M.terminal_statuses = TERMINAL_STATUSES
 M.valid_permission_snapshot = valid_permission_snapshot
 
 return M

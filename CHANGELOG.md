@@ -6,6 +6,38 @@ Notable changes are recorded here. Releases follow semantic versioning.
 
 ### Added
 
+- **The Git ticket tab.** `github-broker`'s git write-tickets — the operator
+  approval that unlocks `workflows: write` for one push — are now reviewed in
+  mcp-buff, with their own state machine, their own
+  `zemrip.git-ticket.v1` digest domain, and their own account of what an
+  approval does.
+- **One panel, one tab per broker.** `:McpBuff` now opens a tabbed review
+  surface: each tab holds that broker's ticket queue and its runtime
+  permission subset, because everything about one provider shares one
+  capability, one loopback socket, and one blast radius. `<Tab>`/`<S-Tab>`
+  cycle, `1`/`2` jump, and `:McpBuff <provider>` opens straight to one without
+  reading the other broker's capability on the way. The tab bar carries each
+  broker's pending count and marks unapplied permission edits, so an inactive
+  tab can still ask for attention.
+- A ticket-source registry (`lua/mcp_buff/sources/`). A source owns one
+  broker's digest domain, state machine, statuses, and request renderers; the
+  panel, client, and renderer know only that interface. A third broker is one
+  new file plus one configuration key.
+- A per-source scope registry with an **exact and total** shape matcher, for
+  the further GitHub scopes to come. A broker release that adds a term to a
+  request stops matching and falls through to the unrecognised-scope renderer,
+  which shows the whole record and says so — rather than describing the ticket
+  with the shape it nearly fits. A unit test adds a scope the way a future
+  release would and asserts nothing outside the source module has to change.
+- A distinct group and warning for a ticket status this release has no entry
+  for. It is never folded into `failed` (which would assert the request did
+  not happen) or `pending` (which would offer a decision).
+- `scripts/stub-git-admin-server.js`, a second dependency-free stub for the
+  GitHub admin contract. The smoke test now runs two stubs with two different
+  capabilities, so a client that reused one socket's bearer on the other
+  cannot pass.
+- `pending_count(provider)` for one broker; `pending_count()` now totals every
+  broker.
 - Optional `tunnel` configuration for a panel-scoped, loopback-only SSH
   forward. McpBuff launches SSH without a shell, waits for its listener before
   reading the admin capability, refuses an already occupied local port, and
@@ -16,10 +48,51 @@ Notable changes are recorded here. Releases follow semantic versioning.
 
 ### Changed
 
-- Closing or hiding the panel now clears the capability and stops a managed
-  tunnel. An in-flight approve or deny retains the route until outcome
-  resolution completes; background refresh never reopens a closed managed
-  route.
+- `canonical.verify()`, `ticket_digest()`, and `ticket_preimage()` now require
+  an explicit digest domain and refuse without one. A defaulted domain is the
+  cross-broker replay the digest exists to stop: the two brokers hold
+  different powers and are reviewed in the same panel, so a shared prefix
+  would make a digest typed for a Cloudflare ticket valid for a git ticket
+  with an identical immutable payload.
+- The decision path now polls until a decision is **settled**, not until the
+  ticket is terminal. The git broker's approve unlocks a token rather than
+  executing anything, so a successful approval leaves a ticket that is decided
+  but still has a transition left; polling for terminal there would sit out
+  the whole deadline and then report an unknown outcome for a ticket just
+  successfully approved. A `200` carrying a status this release cannot name is
+  still resolved by polling.
+- `decision_timeout` and `poll_deadline` now default per broker — 1865/1865
+  for Cloudflare, whose approval executes a chain of live mutations inside the
+  POST, and 120/300 for the GitHub broker, which writes one small file. An
+  explicit setting still overrides both.
+- Concurrent reads of one capability share a single fetch. A tab reads its
+  ticket list and its permission document together, so without coalescing one
+  keystroke raised two pinentry prompts for one credential.
+- The background timer now refreshes the visible tab only, and can neither
+  read a credential nor open an SSH route: a closed managed forward skips the
+  tick rather than launching `ssh`.
+- `:McpBuffPermissions [provider]` now moves the cursor to that tab's
+  permissions section rather than opening a panel of its own, and **the active
+  tab is the apply target** — there is nothing to infer from the cursor row.
+  `A` applies; `<Space>` and `<CR>` toggle.
+- `setup()` gained a `github = { … }` broker key and now rejects an unknown
+  top-level option instead of ignoring it. `permissions = { cloudflare, github }`
+  is still accepted and mapped rather than reinterpreted:
+  `permissions.github` configured that broker's connection, so that is what it
+  still configures. Configuring one broker under both spellings is an error
+  rather than a merge.
+- Closing or hiding the panel now clears every capability and stops every
+  managed tunnel. An in-flight approve, deny, or permission update retains
+  that broker's route until outcome resolution completes; background refresh
+  never reopens a closed managed route.
+- Ticket detail buffers are namespaced per provider
+  (`mcpbuff://<provider>/ticket/<id>`), and the panel buffer is
+  `mcpbuff://review`. Two brokers mint ids from the same pattern, so an
+  un-namespaced name could show one broker's ticket under the other's heading.
+- The typed-confirmation prompt now names the broker, says what the decision
+  authorises, and lists one line per step naming its scope. The two brokers
+  mean different things by "approve", and that difference belongs on screen at
+  the moment the keystroke becomes irrevocable.
 
 ## 2.0.0
 

@@ -1,13 +1,23 @@
--- Canonical JSON and the broker's immutable ticket digest, recomputed locally.
+-- Canonical JSON and each broker's immutable ticket digest, recomputed locally.
 --
--- The broker binds every decision to sha256 over a versioned preimage. A client
+-- Every broker binds a decision to sha256 over a versioned preimage. A client
 -- that cannot reproduce that digest byte-for-byte must refuse to submit, so this
 -- encoder is deliberately narrow: it emits only what it can prove matches
 -- JavaScript's JSON.stringify, and returns nil for everything else.
+--
+-- The preimage differs between brokers in exactly one place: the domain prefix.
+-- That difference is load-bearing rather than cosmetic. The two brokers hold
+-- different powers and are reviewed in the same panel, so a shared prefix would
+-- make a digest the operator typed for a Cloudflare ticket a valid digest for a
+-- git ticket carrying the same immutable payload -- the cross-ticket replay the
+-- digest exists to stop. Nothing here defaults the prefix for that reason.
 
 local M = {}
 
-M.TICKET_DIGEST_VERSION = 'zemrip.mcp-ticket.v1'
+-- Cloudflare write tickets: apps/local/mcp-broker.
+M.CLOUDFLARE_TICKET_PREFIX = 'zemrip.mcp-ticket.v1'
+-- Git write tickets: apps/local/github-broker.
+M.GIT_TICKET_PREFIX = 'zemrip.git-ticket.v1'
 
 -- vim.json.decode marks a decoded `{}` with the vim.empty_dict metatable and
 -- leaves a decoded `[]` as a bare table, which is the only way to tell the two
@@ -117,9 +127,17 @@ end
 
 local IMMUTABLE_STRINGS = { 'id', 'created', 'expires', 'reason' }
 
---- Build the exact digest preimage: version prefix, one newline, canonical JSON
---- of the five immutable fields. Returns nil when the ticket is unusable.
-function M.ticket_preimage(ticket)
+local KNOWN_PREFIXES = {
+  [M.CLOUDFLARE_TICKET_PREFIX] = true,
+  [M.GIT_TICKET_PREFIX] = true,
+}
+
+--- Both brokers sign the same five immutable fields, so one preimage builder
+--- serves both. Only the domain prefix is passed in, and only a prefix this
+--- release knows is accepted: a caller that forgets it, or that computes one
+--- from server-supplied data, gets a refusal rather than a digest.
+function M.ticket_preimage(ticket, prefix)
+  if not KNOWN_PREFIXES[prefix] then return nil end
   if type(ticket) ~= 'table' then return nil end
   for _, field in ipairs(IMMUTABLE_STRINGS) do
     if type(ticket[field]) ~= 'string' then return nil end
@@ -134,28 +152,38 @@ function M.ticket_preimage(ticket)
     requests = ticket.requests,
   })
   if not encoded then return nil end
-  return M.TICKET_DIGEST_VERSION .. '\n' .. encoded
+  return prefix .. '\n' .. encoded
 end
 
 --- Recompute ticket_sha256 from the ticket's own immutable fields.
-function M.ticket_digest(ticket)
-  local preimage = M.ticket_preimage(ticket)
+function M.ticket_digest(ticket, prefix)
+  local preimage = M.ticket_preimage(ticket, prefix)
   if not preimage then return nil end
   return vim.fn.sha256(preimage)
 end
 
---- Compare the served digest with a local recomputation.
+--- Compare the served digest with a local recomputation in one digest domain.
 --- Returns true only when both exist and agree; the second value explains a
 --- refusal so the panel can tell the operator which half went wrong.
-function M.verify(ticket)
+---
+--- prefix is required. A verification that silently picked a domain would
+--- confirm a digest against the wrong broker, which is worse than not
+--- verifying at all, so a missing or unknown prefix fails closed here rather
+--- than raising out of the decision path.
+function M.verify(ticket, prefix)
+  if not KNOWN_PREFIXES[prefix] then
+    return false, 'no known ticket digest domain was supplied, so this digest '
+      .. 'cannot be verified against the broker that issued it'
+  end
   local served = type(ticket) == 'table' and ticket.ticket_sha256 or nil
   if type(served) ~= 'string' or not served:match('^[a-f0-9]+$') or #served ~= 64 then
     return false, 'the broker did not serve a well-formed ticket_sha256'
   end
-  local recomputed = M.ticket_digest(ticket)
+  local recomputed = M.ticket_digest(ticket, prefix)
   if not recomputed then
     return false, 'this ticket contains a value mcp-buff cannot canonicalise, '
-      .. 'so its digest cannot be verified; review it with mcp-broker-admin'
+      .. 'so its digest cannot be verified; review it with the broker\'s own '
+      .. 'admin helper'
   end
   if recomputed ~= served then
     return false, 'recomputed digest ' .. recomputed .. ' does not match the served '
