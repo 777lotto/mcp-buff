@@ -208,13 +208,49 @@ function M.group_tickets(source, tickets)
     bucket[#bucket + 1] = ticket
   end
   local function newest_first(left, right)
-    return tostring(left.created or '') > tostring(right.created or '')
+    local left_created = tostring(left.created or '')
+    local right_created = tostring(right.created or '')
+    if left_created ~= right_created then return left_created > right_created end
+    -- Millisecond timestamps can still tie. A deterministic id tie-break keeps
+    -- a preview move aligned with a separately rendered copy of the same list.
+    return tostring(left.id or '') < tostring(right.id or '')
   end
   for _, status in ipairs(source.status_order) do
     table.sort(grouped[status], newest_first)
   end
   table.sort(unknown, newest_first)
   return grouped, unknown
+end
+
+--- The non-empty categories in exactly the order the panel displays them.
+---
+--- Preview navigation consumes this rather than rebuilding status order from
+--- the ticket under the cursor. That keeps `>`/`<` on the visible list order
+--- and lets `<Tab>` skip the empty headings the panel renders for orientation.
+--- All statuses unknown to this release remain one category, just as they are
+--- in the panel; guessing an order between unknown state names would invent a
+--- state machine the source has not declared.
+function M.ticket_categories(source, tickets)
+  local grouped, unknown = M.group_tickets(source, tickets)
+  local categories = {}
+  for _, status in ipairs(source.status_order) do
+    local group = grouped[status]
+    if #group > 0 then
+      categories[#categories + 1] = {
+        id = status,
+        label = source.status_labels[status],
+        tickets = group,
+      }
+    end
+  end
+  if #unknown > 0 then
+    categories[#categories + 1] = {
+      id = 'unknown',
+      label = M.UNKNOWN_STATUS_LABEL,
+      tickets = unknown,
+    }
+  end
+  return categories
 end
 
 function M.pending_count(source, tickets)
@@ -441,9 +477,11 @@ function M.detail(source, ticket)
   end
   lines[#lines + 1] = ''
   if source.decidable[ticket.status] then
-    lines[#lines + 1] = '_`a` approve · `d` deny · `r` refresh · `q` or `<Esc>` close._'
+    lines[#lines + 1] = '_`a` approve · `d` deny · `>`/`<` ticket · '
+      .. '`<Tab>`/`<S-Tab>` category · `r` refresh · `q` or `<Esc>` close._'
   else
-    lines[#lines + 1] = '_Press `q` or `<Esc>` to close._'
+    lines[#lines + 1] = '_`>`/`<` ticket · `<Tab>`/`<S-Tab>` category · '
+      .. '`r` refresh · `q` or `<Esc>` close._'
   end
   return table.concat(lines, '\n')
 end
