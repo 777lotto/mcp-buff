@@ -702,24 +702,16 @@ operator.
 
 - `bluff` is the default and only long-lived branch.
 - Focused branches start from and merge into `bluff`.
-- Signed `vX.Y.Z` tags and GitHub Releases mark tested `bluff` commits.
+- CI-created `vX.Y.Z` tags and GitHub Releases mark tested `bluff` commits.
 
-After a merge into `bluff`, successful completion of the entire `CI` workflow
-requests a focused `mcp-buff` lockfile refresh in `777lotto/nvim-config`, using
-the exact commit that passed CI. Failed, cancelled, and pull-request CI runs
-do not notify the configuration. This opens or updates a dependency PR; it
-does not publish a Release or update a running Neovim installation.
-
-Publishing a stable GitHub Release or manually running `Notify nvim-config`
-also requests an exact-commit refresh. Configure the plugin repository
-secret
-`NVIM_CONFIG_DISPATCH_TOKEN` with a fine-grained token scoped only to
-`777lotto/nvim-config` and its Contents permission set to write. If the secret
-is absent, the notification workflow fails with a setup error;
-it never changes the plugin loopback, SSH, or network boundary. Creating the
-signed tag and Release, and provisioning that repository secret, are operator
-actions; the credential-free ZemRip agent broker deliberately exposes none of
-those APIs.
+Successful push CI on the current `bluff` head automatically publishes a
+versioned GitHub Release and notifies `nvim-config` with that exact commit.
+CI creates unsigned tags, starting at `v0.1.0` and incrementing the patch
+version. Failed or superseded runs do not publish. The existing
+`NVIM_CONFIG_DISPATCH_TOKEN` repository secret enables notification; a missing
+secret fails visibly after publication. See [release automation](docs/releases.md)
+for retry behavior, versioning, and the distinction between plugin releases
+and configuration adoption.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for checks and pull-request guidance.
 
