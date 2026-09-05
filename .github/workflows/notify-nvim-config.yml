@@ -1,13 +1,6 @@
 name: Notify nvim-config
 
 on:
-  workflow_run:
-    workflows:
-      - CI
-    types:
-      - completed
-    branches:
-      - bluff
   release:
     types:
       - published
@@ -19,22 +12,13 @@ permissions:
 jobs:
   dispatch:
     name: request focused lock refresh
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'release' && github.event.release.prerelease == false) ||
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch == 'bluff' &&
-       github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'release' && github.event.release.prerelease == false)
     runs-on: ubuntu-24.04
     steps:
-      # Do not check out or execute code from the triggering run. Only its
-      # tested commit is forwarded; github.sha would mean today's default head.
       - name: Dispatch exact MCP Buff commit
         env:
           GH_TOKEN: ${{ secrets.NVIM_CONFIG_DISPATCH_TOKEN }}
-          PLUGIN_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+          PLUGIN_COMMIT: ${{ github.sha }}
           PLUGIN_TAG: ${{ github.event.release.tag_name }}
           DISPATCH_SOURCE: ${{ github.event_name }}
         run: |
