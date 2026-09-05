@@ -444,13 +444,21 @@ Mappings are local to the panel buffer:
 `<NL>` and keypad Enter work like `<CR>`, matching terminal-safe GitPanel
 behavior.
 
-The detail window is a review surface, not a modal: `a`, `d`, `r`, `<CR>`,
-`<Tab>` and `1` … `N` all work inside it, and `q` or `<Esc>` closes it and
-leaves the panel behind. A decision taken there acts on the ticket the window
-is showing, whatever the panel cursor is sitting on underneath. There is one
-detail window, reused: opening another ticket, or deciding this one, replaces
-its contents rather than stacking a second float on top. Long prose wraps at
-word boundaries within the float, with continued lines indented for readability.
+The detail window is a review surface, not a modal. `>` and `<` open the next
+and previous ticket in the current status category; they stop at that
+category's ends. `<Tab>` and `<S-Tab>` cycle through non-empty ticket categories
+and open the top (newest) ticket in each. These moves only fetch detail: they do
+not approve, deny, or close anything, and the panel cursor follows the ticket
+shown. `a`, `d`, `r`, `<CR>`, and `1` … `N` also work inside the detail window;
+the number keys still switch broker tabs. `q` or `<Esc>` closes the float and
+leaves the panel behind.
+
+A decision taken there acts on the ticket the window is showing, whatever the
+panel cursor was sitting on underneath. There is one detail window, reused:
+navigating, opening another ticket, or deciding this one replaces its contents
+rather than stacking another float on top. The preview owns its display
+filetype, starts each ticket at the top, and wraps long prose at word boundaries
+within the float, with continued lines indented for readability.
 
 Closing the panel during an in-flight decision or permission update keeps that
 broker's owned route alive until the result is accounted for, then closes it.

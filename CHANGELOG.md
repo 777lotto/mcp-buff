@@ -6,6 +6,11 @@ Notable changes are recorded here. Releases follow semantic versioning.
 
 ### Added
 
+- **Queue navigation inside ticket detail.** `>` and `<` move to the next and
+  previous ticket in the current status group, while `<Tab>` and `<S-Tab>`
+  cycle through non-empty groups and open each one's newest ticket. Navigation
+  performs only a detail read, keeps one float open, and moves the panel cursor
+  to the ticket being shown.
 - **The Git ticket tab.** `github-broker`'s git write-tickets — the operator
   approval that unlocks `workflows: write` for one push — are now reviewed in
   mcp-buff, with their own state machine, their own
@@ -48,9 +53,10 @@ Notable changes are recorded here. Releases follow semantic versioning.
 
 ### Changed
 
-- Ticket detail floats now wrap long prose at word boundaries and indent
-  continuation lines, so the complete review context is readable without
-  horizontal scrolling.
+- Ticket detail floats now use a plugin-owned display filetype, reset inherited
+  scroll offsets, size themselves from wrapped screen rows, wrap long prose at
+  word boundaries, and indent continuation lines. Generic Markdown tooling can
+  no longer override the review window into horizontal scrolling.
 - `bluff` is now the default and only long-lived branch; CI, release
   notification, and contributor guidance no longer retain the retired `bet`
   promotion path.
@@ -109,11 +115,11 @@ Notable changes are recorded here. Releases follow semantic versioning.
   require the typed state digest: that write has no operation id to poll, so
   its compare-and-swap ceremony is doing different work.
 - **The ticket detail window is a decision surface.** `a`, `d`, `r`, `<CR>`,
-  `<Tab>`, `<S-Tab>` and `1` … `N` all work inside it — previously `a` there
-  began an insert into a read-only buffer — and a decision taken in it acts on
-  the ticket it is showing, whatever the panel cursor sits on underneath. The
-  permission keys are deliberately absent, because the float has no permission
-  rows to act on.
+  `>`, `<`, `<Tab>`, `<S-Tab>` and `1` … `N` all work inside it — previously
+  `a` there began an insert into a read-only buffer — and a decision taken in it
+  acts on the ticket it is showing, whatever the panel cursor sits on
+  underneath. The permission keys are deliberately absent, because the float
+  has no permission rows to act on.
 - **One detail window, reused.** Opening another ticket, or deciding the one on
   screen, replaces its contents rather than stacking a float on top of a float,
   so a decision leaves the settled ticket in front of the operator.

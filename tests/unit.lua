@@ -529,6 +529,47 @@ local function test_list_rendering()
     'pending group was not rendered first')
 end
 
+local function test_ticket_categories_follow_the_visible_list()
+  local categories = render.ticket_categories(github, {
+    {
+      id = 'pending-older',
+      created = '2026-09-03T09:00:00Z',
+      status = 'pending',
+    },
+    {
+      id = 'unknown-older',
+      created = '2026-09-03T08:00:00Z',
+      status = 'quarantined',
+    },
+    {
+      id = 'approved',
+      created = '2026-09-03T07:00:00Z',
+      status = 'approved',
+    },
+    {
+      id = 'pending-newer',
+      created = '2026-09-03T10:00:00Z',
+      status = 'pending',
+    },
+    {
+      id = 'unknown-newer',
+      created = '2026-09-03T11:00:00Z',
+      status = 'held-for-review',
+    },
+  })
+
+  equal(#categories, 3, 'empty status headings became preview destinations')
+  equal(categories[1].id, 'pending')
+  equal(categories[1].tickets[1].id, 'pending-newer',
+    'ticket navigation disagrees with the list\'s newest-first order')
+  equal(categories[1].tickets[2].id, 'pending-older')
+  equal(categories[2].id, 'approved')
+  equal(categories[3].id, 'unknown')
+  equal(categories[3].label, render.UNKNOWN_STATUS_LABEL)
+  equal(categories[3].tickets[1].id, 'unknown-newer',
+    'unrecognised statuses did not remain one visible category')
+end
+
 --- A status the broker served that this release has no entry for.
 ---
 --- The safe presentation is its own bucket with its own warning. Folding it
@@ -941,7 +982,9 @@ local function test_the_detail_is_the_confirmation_surface()
   -- would take one.
   local decided = render.detail(cloudflare, DETAIL_TICKET)
   excludes(decided, '`a` approves and `d` denies')
-  contains(decided, 'Press `q` or `<Esc>` to close.')
+  excludes(decided, '`a` approve')
+  contains(decided, '`>`/`<` ticket')
+  contains(decided, '`q` or `<Esc>` close')
 end
 
 local function test_decision_timeout_bounds()
@@ -1670,6 +1713,7 @@ test_provider_specific_wire_facts()
 test_digest_domains_are_separate()
 test_indeterminate_is_its_own_state()
 test_list_rendering()
+test_ticket_categories_follow_the_visible_list()
 test_unknown_status_is_not_folded()
 test_tab_bar_marks_state()
 test_unconfigured_tab_explains_itself()

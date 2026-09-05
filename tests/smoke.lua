@@ -181,6 +181,10 @@ local function focus(ticket_id)
   point_at(ticket_id)
 end
 
+local function press(keys)
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'x', false)
+end
+
 --- Run a body with every typed-input path booby-trapped.
 ---
 --- A decision must not ask for anything: no digest to retype, no prompt of any
@@ -318,10 +322,83 @@ local function test_detail_renders_the_reviewable_payload()
   equal(vim.api.nvim_get_option_value('buftype', { buf = panel.buf }), 'nofile')
   equal(vim.api.nvim_get_option_value('swapfile', { buf = panel.buf }), false)
   equal(vim.api.nvim_get_option_value('undofile', { buf = panel.buf }), false)
+  equal(vim.api.nvim_get_option_value('filetype', { buf = buffer }), 'mcpbuffdetail')
+  equal(vim.api.nvim_get_option_value('syntax', { buf = buffer }), 'markdown')
   equal(vim.api.nvim_get_option_value('wrap', { win = float }), true)
   equal(vim.api.nvim_get_option_value('linebreak', { win = float }), true)
   equal(vim.api.nvim_get_option_value('breakindent', { win = float }), true)
+  equal(vim.api.nvim_get_option_value('breakindentopt', { win = float }),
+    'shift:2,min:20')
+
+  -- Prove display behavior, not only the option values. This path is longer
+  -- than the float, so it must consume multiple screen rows while leftcol
+  -- stays at zero even with the cursor at the end.
+  local wrapped_row
+  for index, line in ipairs(vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) do
+    if line:find('**Precondition:**', 1, true) then
+      wrapped_row = index
+      vim.api.nvim_win_set_cursor(float, { index, #line })
+      break
+    end
+  end
+  assert(wrapped_row, 'the long detail line was not rendered')
+  local height = vim.api.nvim_win_text_height(float, {
+    start_row = wrapped_row - 1,
+    end_row = wrapped_row - 1,
+  })
+  assert(height.all > 1, 'the long ticket line did not wrap inside the float')
+  equal(vim.api.nvim_win_call(float, function() return vim.fn.winsaveview().leftcol end), 0,
+    'viewing the end of a long ticket line introduced horizontal scrolling')
   vim.api.nvim_buf_delete(buffer, { force = true })
+end
+
+--- The preview follows the same status groups and ticket ordering as the list.
+--- Every move is a detail GET only: the float and provider stay put, and no
+--- decision endpoint is touched.
+local function test_preview_navigation_stays_in_the_float()
+  local before = stats().decision_posts
+  focus(ids.deny) -- newest/top Pending ticket
+  panel.primary()
+  local first_name = 'mcpbuff://cloudflare/ticket/' .. ids.deny
+  wait_for(function() return find_buffer(first_name) ~= nil end,
+    'the starting preview did not open')
+  local float = vim.api.nvim_get_current_win()
+
+  local function showing(ticket_id)
+    if not vim.api.nvim_win_is_valid(float) then return false end
+    local name = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(float))
+    return name == 'mcpbuff://cloudflare/ticket/' .. ticket_id
+  end
+  assert(showing(ids.deny), 'the starting preview did not take focus')
+
+  press('>')
+  wait_for(function() return showing(ids.approve) end,
+    '> did not open the next ticket in Pending')
+  equal(vim.api.nvim_get_current_win(), float, '> replaced the preview window')
+  local panel_line = vim.api.nvim_win_get_cursor(panel.win)[1]
+  contains(vim.api.nvim_buf_get_lines(panel.buf, panel_line - 1, panel_line, false)[1],
+    ids.approve, 'the list cursor did not follow preview navigation')
+
+  press('<lt>')
+  wait_for(function() return showing(ids.deny) end,
+    '< did not open the previous ticket in Pending')
+
+  -- Empty Approved/Executing groups are headings, not destinations. The next
+  -- non-empty category after Pending is Indeterminate, whose top ticket opens.
+  press('<Tab>')
+  wait_for(function() return showing(ids.indeterminate) end,
+    '<Tab> did not open the next non-empty ticket category')
+  equal(panel.active, 'cloudflare', '<Tab> left the preview\'s broker tab')
+  equal(vim.api.nvim_get_current_win(), float, '<Tab> closed the preview window')
+
+  press('<S-Tab>')
+  wait_for(function() return showing(ids.deny) end,
+    '<S-Tab> did not return to the previous ticket category\'s top row')
+  equal(stats().decision_posts, before,
+    'preview navigation submitted a ticket decision')
+
+  press('q')
+  assert(not vim.api.nvim_win_is_valid(float), 'q did not close the navigated preview')
 end
 
 local function test_recomputed_digest_matches_the_served_one()
@@ -866,6 +943,22 @@ local function test_the_preview_decides_the_ticket_it_shows()
   assert(vim.api.nvim_win_get_config(float).relative ~= '',
     'the ticket detail is not a float')
 
+  -- The same navigation contract applies to the Git source. Its next
+  -- non-empty category is Approved, and Shift-Tab returns to Pending without
+  -- changing broker tabs or submitting either ticket.
+  press('<Tab>')
+  wait_for(function()
+    return vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(float))
+      == 'mcpbuff://github/ticket/' .. git_ids.approve
+  end, 'Git preview <Tab> did not open the next ticket category')
+  equal(vim.api.nvim_get_current_win(), float, 'Git preview navigation replaced the float')
+  press('<S-Tab>')
+  wait_for(function()
+    return vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(float)) == detail_name
+  end, 'Git preview <S-Tab> did not return to Pending')
+  equal(git_stats().decision_posts, before,
+    'Git preview category navigation submitted a decision')
+
   -- The row behind the float is an expired ticket, which the broker cannot
   -- decide. If the keystroke read the cursor instead of the preview, the
   -- approval below would be refused rather than submitted.
@@ -994,6 +1087,7 @@ local function run()
   test_panel_lists_every_state()
   test_listing_prunes_past_retention()
   test_detail_renders_the_reviewable_payload()
+  test_preview_navigation_stays_in_the_float()
   test_recomputed_digest_matches_the_served_one()
   test_transport_gates_and_precedence()
   test_wrong_capability_is_a_bearer_failure()
