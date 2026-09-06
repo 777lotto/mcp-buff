@@ -958,8 +958,8 @@ local function test_the_detail_is_the_confirmation_surface()
   contains(detail, 'executed inside the approval POST itself')
   contains(detail, 'Step 0 · Cloudflare API mutation · PATCH /zones/example-zone')
   -- The keys that decide, on the window that shows the terms.
-  contains(detail, '`a` approves and `d` denies')
-  contains(detail, 'a` approve · `d` deny')
+  contains(detail, '`y` approves and `n` denies')
+  contains(detail, 'y` approve · `n` deny')
 
   local git_detail = render.detail(github, GIT_TICKET)
   contains(git_detail, 'GitHub broker')
@@ -981,10 +981,10 @@ local function test_the_detail_is_the_confirmation_surface()
   -- A decided ticket offers no decision, so it must not advertise the keys that
   -- would take one.
   local decided = render.detail(cloudflare, DETAIL_TICKET)
-  excludes(decided, '`a` approves and `d` denies')
-  excludes(decided, '`a` approve')
+  excludes(decided, '`y` approves and `n` denies')
+  excludes(decided, '`y` approve')
   contains(decided, '`>`/`<` ticket')
-  contains(decided, '`q` or `<Esc>` close')
+  contains(decided, '`c` clear')
 end
 
 local function test_decision_timeout_bounds()

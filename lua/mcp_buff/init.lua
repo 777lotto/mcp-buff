@@ -1,4 +1,4 @@
--- The review panel: one window, one tab per broker.
+-- The review panel: an overview and context pane, one tab per broker.
 --
 -- Each tab owns everything about one provider -- its ticket queue and its
 -- runtime permission subset -- because everything about one provider shares one
@@ -131,24 +131,13 @@ local function notify(message, level)
 end
 
 -- ---------------------------------------------------------------------------
--- The preview float
+-- The right-hand ticket context pane
 -- ---------------------------------------------------------------------------
 
--- One preview window, reused for every ticket the panel opens.
---
--- It is not a passive viewer. A decision is taken from inside it -- `a` and
--- `d` are mapped there too, because reading the payload and deciding it are
--- one act, and a review surface the operator has to leave before they can act
--- is a review surface they stop opening.
---
--- Reused rather than stacked for the same reason: a decision opens the payload
--- it is about to submit and then the settled ticket, so one keystroke would
--- otherwise bury the panel under a pile of floats, and a decision taken in a
--- float would be ambiguous about which of the visible tickets it meant.
 local preview = { win = nil, buf = nil, tab = nil, ticket = nil, request = 0 }
 local navigate_preview_ticket
-local navigate_preview_category
 local point_panel_at_ticket
+local show_detail
 
 local function preview_visible()
   return preview.win ~= nil and api.nvim_win_is_valid(preview.win)
@@ -160,10 +149,37 @@ local function preview_focused()
   return preview_visible() and api.nvim_get_current_win() == preview.win
 end
 
-local function close_preview()
+local function close_preview(clear_only)
   preview.request = preview.request + 1
-  if preview_visible() then pcall(api.nvim_win_close, preview.win, true) end
-  preview.win, preview.buf, preview.tab, preview.ticket = nil, nil, nil, nil
+  if preview_visible() then
+    if clear_only then
+      local buf = preview.buf
+      if buf and api.nvim_buf_is_valid(buf) then
+        api.nvim_set_option_value('modifiable', true, { buf = buf })
+        api.nvim_buf_set_lines(buf, 0, -1, false, {})
+        api.nvim_set_option_value('modifiable', false, { buf = buf })
+        pcall(api.nvim_buf_set_name, buf, 'mcpbuff://context')
+      end
+    elseif preview.original and api.nvim_buf_is_valid(preview.original) then
+      api.nvim_win_set_buf(preview.win, preview.original)
+      for option, value in pairs(preview.options or {}) do
+        api.nvim_set_option_value(option, value, { win = preview.win })
+      end
+    else
+      pcall(api.nvim_win_close, preview.win, true)
+    end
+  end
+  preview.tab, preview.ticket = nil, nil
+  if not clear_only then
+    preview.win, preview.buf, preview.original, preview.options = nil, nil, nil, nil
+  end
+  local window = find_window()
+  if window then api.nvim_set_current_win(window) end
+end
+
+local function switch_pane()
+  local window = preview_focused() and find_window() or preview.win
+  if window and api.nvim_win_is_valid(window) then api.nvim_set_current_win(window) end
 end
 
 -- ---------------------------------------------------------------------------
@@ -202,10 +218,35 @@ local function rerender()
   tab.shows_permissions = tab.broker:shows_permissions()
   local rendered = render.panel(bar, tab, { width = width })
 
+  local selected = window and M.line_map[api.nvim_win_get_cursor(window)[1]]
+  local old_category, old_index
+  if selected and selected.kind == 'ticket' and selected.tab == tab then
+    old_category = selected.ticket.status
+    old_index = 0
+    for line = 1, api.nvim_win_get_cursor(window)[1] do
+      local item = M.line_map[line]
+      if item and item.kind == 'ticket' and item.ticket.status == old_category then
+        old_index = old_index + 1
+      end
+    end
+  end
   M.line_map = rendered.map
   with_writable(function()
     api.nvim_buf_set_lines(M.buf, 0, -1, false, rendered.lines)
   end)
+  if old_category then
+    local same_line, heading, category_lines = nil, nil, {}
+    for line, item in pairs(M.line_map) do
+      if item.kind == 'category' and item.status == old_category then heading = line end
+      if item.kind == 'ticket' and item.ticket.status == old_category then
+        category_lines[#category_lines + 1] = line
+        if item.ticket.id == selected.ticket.id then same_line = line end
+      end
+    end
+    table.sort(category_lines)
+    local target = same_line or category_lines[math.min(old_index, #category_lines)] or heading
+    if target then api.nvim_win_set_cursor(window, { target, 0 }) end
+  end
   api.nvim_buf_clear_namespace(M.buf, namespace, 0, -1)
   for _, highlight in ipairs(rendered.highlights) do
     api.nvim_buf_set_extmark(M.buf, namespace, highlight.line, highlight.start_col, {
@@ -282,6 +323,18 @@ local function refresh_tab(tab, opts)
         tab.tickets = tickets or {}
         tab.error = nil
         recount_pending(tab)
+        if preview_visible() and preview.tab == tab and preview.ticket then
+          local request, id = preview.request, preview.ticket.id
+          tab.broker.client:get(id, {
+            allow_capability_fetch = opts.allow_capability_fetch,
+          }, function(detail_error, ticket)
+            if detail_error or stale() or request ~= preview.request then return end
+            if preview.tab == tab and preview.ticket and preview.ticket.id == id then
+              upsert_ticket(tab, ticket)
+              show_detail(tab, ticket, { focus = false })
+            end
+          end)
+        end
       end
       rerender()
     end)
@@ -316,9 +369,9 @@ function M.select_tab(target)
   local tab = index and M.tabs[index]
   if not tab then return end
   -- The preview belongs to the tab it was opened from. Leaving one broker's
-  -- ticket floating over another broker's tab would put a decidable payload in
+  -- ticket displayed beside another broker's tab would put a decidable payload in
   -- front of the operator with the wrong tab bar behind it.
-  if tab.id ~= M.active then close_preview() end
+  if tab.id ~= M.active then close_preview(true) end
   M.active = tab.id
   -- A first visit fetches; a return visit renders what is already held. Cycling
   -- tabs must not re-read a credential each time round.
@@ -341,27 +394,6 @@ function M.previous_tab() M.cycle_tab(-1) end
 -- Ticket detail
 -- ---------------------------------------------------------------------------
 
-local function float_config(tab, ticket, height)
-  local width = math.max(20, math.min(110, vim.o.columns - 4))
-  height = math.max(4, math.min(height, vim.o.lines - 4))
-  return {
-    relative = 'editor',
-    border = 'rounded',
-    title = (' %s · %s '):format(tab.source.title, tostring(ticket.id)),
-    title_pos = 'center',
-    width = width,
-    height = height,
-    row = math.max(1, math.floor((vim.o.lines - height) / 2) - 1),
-    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
-  }
-end
-
---- The keys the preview answers to.
----
---- Deliberately the ticket half of the panel's map, not all of it: a decision
---- and a refresh act on something the float is showing or on the tab behind it,
---- while the permission keys act on a row the float has none of. `q` closes the
---- preview here; the panel's `q` closes the panel.
 local function attach_preview_keys(buf)
   local function map(lhs, callback, description)
     vim.keymap.set('n', lhs, callback, {
@@ -371,23 +403,21 @@ local function attach_preview_keys(buf)
       desc = 'McpBuff: ' .. description,
     })
   end
-  for _, key in ipairs({ 'q', '<Esc>' }) do
-    map(key, function() close_preview() end, 'close ticket detail')
+  for _, key in ipairs({ 'c', 'q', '<Esc>' }) do
+    map(key, function() close_preview(true) end, 'close ticket detail')
   end
-  map('a', function() M.approve() end, 'approve the previewed ticket')
-  map('d', function() M.deny() end, 'deny the previewed ticket')
+  map('y', function() M.approve() end, 'approve the previewed ticket')
+  map('n', function() M.deny() end, 'deny the previewed ticket')
   for _, key in ipairs({ '<CR>', '<NL>', '<kEnter>' }) do
     map(key, function() M.primary() end, 're-read the previewed ticket')
   end
   map('r', function() M.refresh() end, 'refresh this tab')
   map('>', function() navigate_preview_ticket(1) end,
-    'next ticket in this category')
+    'next ticket')
   map('<lt>', function() navigate_preview_ticket(-1) end,
-    'previous ticket in this category')
-  map('<Tab>', function() navigate_preview_category(1) end,
-    'first ticket in the next category')
-  map('<S-Tab>', function() navigate_preview_category(-1) end,
-    'first ticket in the previous category')
+    'previous ticket')
+  map('<Tab>', switch_pane, 'switch focus between panes')
+  map('<S-Tab>', switch_pane, 'switch focus between panes')
   for index = 1, #M.tabs do
     local target = index
     map(tostring(target), function() M.select_tab(target) end,
@@ -395,9 +425,13 @@ local function attach_preview_keys(buf)
   end
 end
 
-local function show_detail(tab, ticket)
+show_detail = function(tab, ticket, opts)
+  opts = opts or {}
+  local same = preview.tab == tab and preview.ticket and preview.ticket.id == ticket.id
+  local view = same and preview_visible() and api.nvim_win_call(preview.win, fn.winsaveview)
+  local focused = api.nvim_get_current_win()
   -- Replacing the visible detail invalidates any older navigation GET that is
-  -- still in flight. Its cache update is harmless; reclaiming the float is not.
+  -- still in flight. Its cache update is harmless; reclaiming the context pane is not.
   preview.request = preview.request + 1
   local text = render.detail(tab.source, ticket)
   local lines = vim.split(text, '\n', { plain = true })
@@ -416,35 +450,27 @@ local function show_detail(tab, ticket)
   api.nvim_set_option_value('syntax', 'markdown', { buf = buf })
   attach_preview_keys(buf)
 
-  local config = float_config(tab, ticket, #lines)
-  if preview_visible() then
-    -- Into the window that is already open, so the ticket the operator can see
-    -- and the ticket their next keystroke decides are always the same one. The
-    -- cursor follows it there, exactly as it follows a newly opened float: a
-    -- ticket put on screen for review is one the operator is meant to be in.
-    api.nvim_win_set_buf(preview.win, buf)
-    api.nvim_win_set_config(preview.win, config)
-    api.nvim_set_current_win(preview.win)
-  else
-    config.style = 'minimal'
-    preview.win = api.nvim_open_win(buf, true, config)
+  if not preview_visible() then
+    local window = find_window()
+    if not window then return end
+    api.nvim_set_current_win(window)
+    vim.cmd('rightbelow vsplit')
+    preview.win = api.nvim_get_current_win()
   end
+  api.nvim_win_set_buf(preview.win, buf)
+  if opts.focus ~= false then api.nvim_set_current_win(preview.win) end
   api.nvim_set_option_value('wrap', true, { win = preview.win })
   api.nvim_set_option_value('linebreak', true, { win = preview.win })
   api.nvim_set_option_value('breakindent', true, { win = preview.win })
   api.nvim_set_option_value('breakindentopt', 'shift:2,min:20', { win = preview.win })
   api.nvim_set_option_value('sidescrolloff', 0, { win = preview.win })
 
-  -- A reused window may have been scrolled in either direction. Every newly
-  -- selected ticket starts at its beginning, with no inherited horizontal
-  -- offset, and the float is sized from wrapped screen rows rather than raw
-  -- buffer lines.
-  api.nvim_win_set_cursor(preview.win, { 1, 0 })
   api.nvim_win_call(preview.win, function()
-    fn.winrestview({ lnum = 1, col = 0, topline = 1, leftcol = 0, skipcol = 0 })
+    fn.winrestview(view or { lnum = 1, col = 0, topline = 1, leftcol = 0, skipcol = 0 })
   end)
-  local display_height = api.nvim_win_text_height(preview.win, {}).all
-  api.nvim_win_set_config(preview.win, float_config(tab, ticket, display_height))
+  if opts.focus == false and api.nvim_win_is_valid(focused) then
+    api.nvim_set_current_win(focused)
+  end
 
   -- Naming comes last, after the buffer this one replaced is gone. The two are
   -- the same ticket whenever a decision re-renders one, and a name still held
@@ -460,7 +486,7 @@ local function show_detail(tab, ticket)
   preview.buf = buf
   preview.tab = tab
   preview.ticket = ticket
-  point_panel_at_ticket(tab, ticket.id)
+  if opts.align then point_panel_at_ticket(tab, ticket.id) end
   return buf, preview.win
 end
 
@@ -473,13 +499,11 @@ end
 --- The ticket a keystroke acts on.
 ---
 --- The preview wins whenever the cursor is inside it, because a ticket the
---- operator is reading is the one they mean, and the panel row behind the float
---- is not something they can see. Everywhere else the cursor row is the target,
+--- operator is reading is the one they mean. The overview may select a
+--- different ticket. Everywhere else the cursor row is the target,
 --- exactly as before.
 local function current_ticket()
-  if preview_focused() and preview.tab then
-    return preview.tab, preview.ticket
-  end
+  if preview_focused() then return preview.tab, preview.ticket end
   local item = current_item()
   if item and item.kind == 'ticket' then return item.tab, item.ticket end
   return nil
@@ -507,7 +531,7 @@ local function fetch_current(callback)
   fetch_ticket(tab, summary, callback)
 end
 
---- Keep the row behind the float aligned with the ticket on screen. Closing
+--- Keep the row behind the context pane aligned with the ticket on screen. Closing
 --- the preview therefore returns to the place the operator navigated to, not
 --- the row where they happened to open it.
 point_panel_at_ticket = function(tab, ticket_id)
@@ -521,57 +545,29 @@ point_panel_at_ticket = function(tab, ticket_id)
   end
 end
 
-local function preview_position()
-  if not (preview_focused() and preview.tab and preview.ticket) then return nil end
-  local categories = render.ticket_categories(preview.tab.source, preview.tab.tickets)
-  for category_index, category in ipairs(categories) do
-    for ticket_index, ticket in ipairs(category.tickets) do
-      if ticket.id == preview.ticket.id then
-        return categories, category_index, ticket_index
-      end
-    end
-  end
-  notify('the previewed ticket is no longer in this tab; reopen it from the list',
-    vim.log.levels.WARN)
-  return nil
-end
-
 local function open_preview_ticket(tab, summary)
-  -- Requests are asynchronous. If another keystroke replaces or closes this
-  -- preview first, the older response may update the list cache but must not
-  -- take the window back from the newer selection.
   preview.request = preview.request + 1
   local request = preview.request
   fetch_ticket(tab, summary, function(target, ticket)
-    if not preview_visible() or preview.request ~= request then return end
-    show_detail(target, ticket)
+    if preview.request ~= request or active_tab() ~= target or not find_window() then return end
+    show_detail(target, ticket, { align = true })
   end)
 end
 
 navigate_preview_ticket = function(direction)
-  local categories, category_index, ticket_index = preview_position()
-  if not categories then return end
-  local category = categories[category_index]
-  local next_index = ticket_index + (direction == -1 and -1 or 1)
-  local target = category.tickets[next_index]
-  if not target then
-    notify(('already at the %s ticket in %s'):format(
-      direction == -1 and 'first' or 'last', category.label))
-    return
+  local tab, current = current_ticket()
+  if not tab then return notify('move the cursor onto a ticket') end
+  local tickets = {}
+  for _, category in ipairs(render.ticket_categories(tab.source, tab.tickets)) do
+    for _, ticket in ipairs(category.tickets) do tickets[#tickets + 1] = ticket end
   end
-  open_preview_ticket(preview.tab, target)
-end
-
-navigate_preview_category = function(direction)
-  local categories, category_index = preview_position()
-  if not categories then return end
-  if #categories < 2 then
-    notify('this tab has no other non-empty ticket category')
-    return
+  for index, ticket in ipairs(tickets) do
+    if ticket.id == current.id then
+      local target = tickets[index + (direction == -1 and -1 or 1)]
+      if target then open_preview_ticket(tab, target) end
+      return
+    end
   end
-  local step = direction == -1 and -1 or 1
-  local next_index = ((category_index - 1 + step) % #categories) + 1
-  open_preview_ticket(preview.tab, categories[next_index].tickets[1])
 end
 
 -- ---------------------------------------------------------------------------
@@ -580,7 +576,10 @@ end
 
 local function report_decision(tab, action, decided, info, show)
   upsert_ticket(tab, decided)
-  if show ~= false then show_detail(tab, decided) end
+  if show ~= false and preview_visible() and preview.tab == tab and preview.ticket
+      and preview.ticket.id == decided.id then
+    show_detail(tab, decided, { focus = false })
+  end
 
   -- Which settled statuses are good news is the source's to say. A settled
   -- decision is not automatically a successful one: Cloudflare's `failed` means
@@ -655,7 +654,9 @@ local function decide(action)
   if tab and tab.decision_active then
     return notify('a decision is already in progress for this tab', vim.log.levels.WARN)
   end
+  local request = preview.request
   fetch_current(function(target, ticket)
+    if request ~= preview.request or active_tab() ~= target or not find_window() then return end
     if not target.broker.client:is_decidable(ticket.status) then
       return notify(('ticket is %s, which %s cannot decide'):format(
         tostring(ticket.status), target.source.title), vim.log.levels.WARN)
@@ -671,7 +672,7 @@ local function decide(action)
       return notify('refusing to submit — ' .. reason, vim.log.levels.ERROR)
     end
 
-    show_detail(target, ticket)
+    show_detail(target, ticket, { focus = false })
 
     if action == 'deny' then
       vim.ui.input({ prompt = 'Denial note (optional; Esc cancels): ' }, function(note)
@@ -743,7 +744,7 @@ end
 --- sensible reading of their own row.
 ---
 --- Inside the preview it re-reads the ticket on screen. The permission branch
---- is skipped there on purpose: the float shows a ticket, and a keystroke that
+--- is skipped there on purpose: the context pane shows a ticket, and a keystroke that
 --- silently toggled a permission row hidden behind it would be acting on
 --- something the operator cannot see.
 function M.primary()
@@ -751,7 +752,8 @@ function M.primary()
     local item = current_item()
     if item and item.kind == 'permission' then return M.toggle_permission() end
   end
-  fetch_current(function(tab, ticket) show_detail(tab, ticket) end)
+  local tab, ticket = current_ticket()
+  if tab then open_preview_ticket(tab, ticket) else notify('move the cursor onto a ticket') end
 end
 
 -- ---------------------------------------------------------------------------
@@ -792,7 +794,7 @@ end
 
 function M.close()
   local deferred = busy()
-  -- Before the window arithmetic below, not after: a float left open would
+  -- Before the window arithmetic below, not after: a context pane left open would
   -- both count as a window and be the only one left if the panel closed first.
   close_preview()
   local window = find_window()
@@ -827,13 +829,16 @@ function M.attach_keys()
   for _, key in ipairs({ '<CR>', '<NL>', '<kEnter>' }) do
     map(key, M.primary, 'open ticket detail or toggle permission')
   end
-  map('a', M.approve, 'approve pending ticket')
-  map('d', M.deny, 'deny pending ticket')
+  map('y', M.approve, 'approve pending ticket')
+  map('n', M.deny, 'deny pending ticket')
   map('<Space>', M.toggle_permission, 'toggle runtime permission')
   map('A', M.apply_permissions, 'apply this tab\'s permission changes')
   map('r', function() M.refresh() end, 'refresh this tab')
-  map('<Tab>', function() M.cycle_tab(1) end, 'next broker tab')
-  map('<S-Tab>', M.previous_tab, 'previous broker tab')
+  map('<Tab>', switch_pane, 'switch focus between panes')
+  map('<S-Tab>', switch_pane, 'switch focus between panes')
+  map('c', function() close_preview(true) end, 'clear ticket context')
+  map('>', function() navigate_preview_ticket(1) end, 'next ticket')
+  map('<lt>', function() navigate_preview_ticket(-1) end, 'previous ticket')
   for index = 1, #M.tabs do
     local target = index
     map(tostring(target), function() M.select_tab(target) end,
@@ -876,7 +881,10 @@ function M.open(provider)
   ensure_buffer()
   if provider then
     for _, tab in ipairs(M.tabs) do
-      if tab.id == provider then M.active = tab.id end
+      if tab.id == provider then
+        if M.active ~= tab.id then close_preview(true) end
+        M.active = tab.id
+      end
     end
   end
   local existing = find_window()
@@ -886,16 +894,28 @@ function M.open(provider)
     M.refresh()
     return
   end
+  local right = api.nvim_get_current_win()
   vim.cmd('topleft vsplit')
   M.win = api.nvim_get_current_win()
   api.nvim_win_set_buf(M.win, M.buf)
-  api.nvim_win_set_width(M.win, math.min(PANEL_WIDTH, math.max(40, vim.o.columns - 8)))
+  api.nvim_win_set_width(M.win, math.min(PANEL_WIDTH, math.max(20, math.floor(vim.o.columns / 2))))
   api.nvim_set_option_value('number', false, { win = M.win })
   api.nvim_set_option_value('relativenumber', false, { win = M.win })
   api.nvim_set_option_value('signcolumn', 'no', { win = M.win })
   api.nvim_set_option_value('cursorline', true, { win = M.win })
   api.nvim_set_option_value('wrap', false, { win = M.win })
   api.nvim_set_option_value('winfixwidth', true, { win = M.win })
+  preview.win = right
+  preview.original = api.nvim_win_get_buf(right)
+  preview.options = {}
+  for _, option in ipairs({ 'wrap', 'linebreak', 'breakindent', 'breakindentopt', 'sidescrolloff' }) do
+    preview.options[option] = api.nvim_get_option_value(option, { win = right })
+  end
+  preview.buf = api.nvim_create_buf(false, true)
+  api.nvim_set_option_value('bufhidden', 'wipe', { buf = preview.buf })
+  api.nvim_set_option_value('modifiable', false, { buf = preview.buf })
+  attach_preview_keys(preview.buf)
+  api.nvim_win_set_buf(right, preview.buf)
   rerender()
   M.refresh()
 end
