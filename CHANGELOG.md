@@ -4,6 +4,15 @@ Notable changes are recorded here. Releases follow semantic versioning.
 
 ## Unreleased
 
+### Changed
+
+- Use the right-hand pane for Cloudflare and Git ticket context. Enter focuses
+  context, Tab switches panes, y/n approve or deny, and c clears context.
+- Navigate the full ticket list across status categories with > and <. Keep
+  overview selection in its original category after a decision, update open
+  context in place, and wrap long detail text at word boundaries.
+
+
 ### Automation
 
 - Publish a versioned Release after successful push CI on the current `bluff`

@@ -226,7 +226,7 @@ end
 ---
 --- Preview navigation consumes this rather than rebuilding status order from
 --- the ticket under the cursor. That keeps `>`/`<` on the visible list order
---- and lets `<Tab>` skip the empty headings the panel renders for orientation.
+--- while skipping the empty headings the panel renders for orientation.
 --- All statuses unknown to this release remain one category, just as they are
 --- in the panel; guessing an order between unknown state names would invent a
 --- state machine the source has not declared.
@@ -276,7 +276,7 @@ local function ticket_section(out, tab, now)
   for _, status in ipairs(source.status_order) do
     local group = grouped[status]
     out:emit((' ▾ Tickets · %s  (%d)'):format(source.status_labels[status], #group),
-      nil, source.status_highlights[status])
+      { kind = 'category', tab = tab, status = status }, source.status_highlights[status])
     if #group == 0 then
       out:emit('     (none)', nil, 'McpBuffHint')
     else
@@ -363,8 +363,8 @@ function M.panel(tabs, tab, opts)
 
   out:emit('  MCP Buff · Broker Review', nil, 'McpBuffHeader')
   tab_bar(out, tabs, tab.id)
-  out:emit('  <CR> detail/toggle · a approve · d deny · A apply permissions', nil, 'McpBuffHint')
-  out:emit('  <Tab> next tab · 1-' .. #tabs .. ' jump · r refresh · q close', nil, 'McpBuffHint')
+  out:emit('  <CR> detail/toggle · y approve · n deny · A apply permissions', nil, 'McpBuffHint')
+  out:emit('  <Tab> switch pane · 1-' .. #tabs .. ' jump · r refresh · q close', nil, 'McpBuffHint')
 
   if not tab.configured then
     out:emit('')
@@ -458,8 +458,8 @@ function M.detail(source, ticket)
       '',
       -- The decision is a keystroke, so this window is the last thing read
       -- before it. Say so here rather than leaving the operator to discover
-      -- that `a` in a detail float is not inert.
-      '`a` approves and `d` denies, here or in the list. The panel re-reads the '
+      -- that `y` in a context pane is not inert.
+      '`y` approves and `n` denies, here or in the list. The panel re-reads the '
         .. 'ticket and re-verifies this digest first, and asks for nothing '
         .. 'else — so the terms above are what you are agreeing to.',
     })
@@ -477,11 +477,11 @@ function M.detail(source, ticket)
   end
   lines[#lines + 1] = ''
   if source.decidable[ticket.status] then
-    lines[#lines + 1] = '_`a` approve · `d` deny · `>`/`<` ticket · '
-      .. '`<Tab>`/`<S-Tab>` category · `r` refresh · `q` or `<Esc>` close._'
+    lines[#lines + 1] = '_`y` approve · `n` deny · `>`/`<` ticket · '
+      .. '`<Tab>` switch pane · `r` refresh · `c` clear._'
   else
-    lines[#lines + 1] = '_`>`/`<` ticket · `<Tab>`/`<S-Tab>` category · '
-      .. '`r` refresh · `q` or `<Esc>` close._'
+    lines[#lines + 1] = '_`>`/`<` ticket · `<Tab>` switch pane · '
+      .. '`r` refresh · `c` clear._'
   end
   return table.concat(lines, '\n')
 end

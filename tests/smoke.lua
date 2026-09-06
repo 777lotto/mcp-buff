@@ -383,22 +383,32 @@ local function test_preview_navigation_stays_in_the_float()
   wait_for(function() return showing(ids.deny) end,
     '< did not open the previous ticket in Pending')
 
-  -- Empty Approved/Executing groups are headings, not destinations. The next
-  -- non-empty category after Pending is Indeterminate, whose top ticket opens.
   press('<Tab>')
-  wait_for(function() return showing(ids.indeterminate) end,
-    '<Tab> did not open the next non-empty ticket category')
-  equal(panel.active, 'cloudflare', '<Tab> left the preview\'s broker tab')
-  equal(vim.api.nvim_get_current_win(), float, '<Tab> closed the preview window')
+  equal(vim.api.nvim_get_current_win(), panel.win, 'Tab did not focus the overview')
+  press('<Tab>')
+  equal(vim.api.nvim_get_current_win(), float, 'Tab did not focus context')
+  local ordered = {}
+  local tab = panel.tabs[1]
+  for _, category in ipairs(require('mcp_buff.render').ticket_categories(tab.source, tab.tickets)) do
+    for _, ticket in ipairs(category.tickets) do ordered[#ordered + 1] = ticket.id end
+  end
+  for index = 2, #ordered do
+    press('>')
+    wait_for(function() return showing(ordered[index]) end, 'next skipped a ticket/category')
+  end
+  press('>')
+  assert(showing(ordered[#ordered]), 'next wrapped past the end')
+  for index = #ordered - 1, 1, -1 do
+    press('<lt>')
+    wait_for(function() return showing(ordered[index]) end, 'previous skipped a ticket/category')
+  end
+  press('<lt>')
+  assert(showing(ordered[1]), 'previous wrapped past the beginning')
+  equal(stats().decision_posts, before, 'navigation submitted a decision')
+  press('c')
+  equal(vim.api.nvim_get_current_win(), panel.win)
+  equal(table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(float), 0, -1, false), '\n'), '')
 
-  press('<S-Tab>')
-  wait_for(function() return showing(ids.deny) end,
-    '<S-Tab> did not return to the previous ticket category\'s top row')
-  equal(stats().decision_posts, before,
-    'preview navigation submitted a ticket decision')
-
-  press('q')
-  assert(not vim.api.nvim_win_is_valid(float), 'q did not close the navigated preview')
 end
 
 local function test_recomputed_digest_matches_the_served_one()
@@ -513,7 +523,7 @@ local function test_one_keystroke_decides_without_a_prompt()
     panel.refresh()
     wait_for(function() return find_line(ids.approve) ~= nil end, 'panel did not refresh')
     focus(ids.approve)
-    panel.approve()
+    press('y')
     wait_for(function()
       local _, current = async(function(done) admin_client():get(ids.approve, done) end)
       return current and current.status == 'executed'
@@ -526,6 +536,11 @@ local function test_one_keystroke_decides_without_a_prompt()
     'the decided ticket was not left in the preview')
   contains(table.concat(vim.api.nvim_buf_get_lines(settled, 0, -1, false), '\n'),
     '**Status:** executed')
+
+  equal(vim.api.nvim_get_current_win(), panel.win, 'approval stole overview focus')
+  local selected = panel.line_map[vim.api.nvim_win_get_cursor(panel.win)[1]]
+  assert(selected and selected.kind == 'ticket' and selected.ticket.id == ids.deny,
+    'cursor followed the approved ticket out of Pending')
 
   -- Exactly one decision reached the broker: a decision is never resubmitted.
   equal(stats().decision_posts, before + 1, 'the decision was submitted more than once')
@@ -577,16 +592,21 @@ end
 
 local function test_deny_reads_denial_note()
   local api = admin_client()
-  local _, ticket = async(function(done) api:get(ids.deny, done) end)
-  local err, denied, info = async(function(done)
-    api:decide(ids.deny, 'deny', {
-      ticket_sha256 = ticket.ticket_sha256,
-      note = '  a fresh read changed the record  ',
-    }, { callback = done })
-  end)
-  assert(not err, vim.inspect(err))
-  equal(denied.status, 'denied')
-  equal(info.polled, false, 'a successful decision was needlessly polled')
+  focus(ids.deny)
+  local original_input = vim.ui.input
+  vim.ui.input = function(_, callback) callback('  a fresh read changed the record  ') end
+  press('n')
+  local denied
+  wait_for(function()
+    local err, current = async(function(done) api:get(ids.deny, done) end)
+    assert(not err, vim.inspect(err))
+    denied = current
+    return denied.status == 'denied'
+  end, 'n did not deny the selected ticket')
+  vim.ui.input = original_input
+  local selected = panel.line_map[vim.api.nvim_win_get_cursor(panel.win)[1]]
+  assert(selected and selected.kind == 'category' and selected.status == 'pending',
+    'the last Pending decision moved the cursor out of its category')
   -- The note comes back under a different name.
   equal(denied.denial_note, 'a fresh read changed the record')
   contains(require('mcp_buff.render').detail(cloudflare_source, denied),
@@ -902,6 +922,17 @@ local function test_a_decision_reaches_only_its_own_broker()
   local before = git_stats().decision_posts
   local cloudflare_before = stats().decision_posts
 
+  local client = tab('github').broker.client
+  local original_decide, settle = client.decide, nil
+  client.decide = function(self, id, action, body, opts)
+    local callback = opts.callback
+    opts.callback = function(...)
+      local args = { ... }
+      settle = function() callback(unpack(args, 1, 3)) end
+    end
+    return original_decide(self, id, action, body, opts)
+  end
+
   without_prompts(function()
     focus(git_ids.future)
     panel.approve()
@@ -910,6 +941,16 @@ local function test_a_decision_reaches_only_its_own_broker()
       return current and current.status == 'approved'
     end, 'the approval did not settle')
   end)
+
+  wait_for(function() return settle ~= nil end, 'decision callback did not arrive')
+  press('<Tab>')
+  local context = vim.api.nvim_get_current_win()
+  press('c')
+  settle()
+  client.decide = original_decide
+  equal(table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(context), 0, -1, false), '\n'), '',
+    'late decision reopened cleared context')
+  equal(vim.api.nvim_get_current_win(), panel.win, 'late decision stole focus')
 
   equal(git_stats().decision_posts, before + 1,
     'the decision was submitted more than once')
@@ -940,24 +981,14 @@ local function test_the_preview_decides_the_ticket_it_shows()
   local float = vim.api.nvim_get_current_win()
   equal(vim.api.nvim_win_get_buf(float), find_buffer(detail_name),
     'the preview did not take the cursor')
-  assert(vim.api.nvim_win_get_config(float).relative ~= '',
-    'the ticket detail is not a float')
+  assert(vim.api.nvim_win_get_config(float).relative == '',
+    'the ticket detail is not a split')
 
-  -- The same navigation contract applies to the Git source. Its next
-  -- non-empty category is Approved, and Shift-Tab returns to Pending without
-  -- changing broker tabs or submitting either ticket.
   press('<Tab>')
-  wait_for(function()
-    return vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(float))
-      == 'mcpbuff://github/ticket/' .. git_ids.approve
-  end, 'Git preview <Tab> did not open the next ticket category')
-  equal(vim.api.nvim_get_current_win(), float, 'Git preview navigation replaced the float')
-  press('<S-Tab>')
-  wait_for(function()
-    return vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(float)) == detail_name
-  end, 'Git preview <S-Tab> did not return to Pending')
-  equal(git_stats().decision_posts, before,
-    'Git preview category navigation submitted a decision')
+  equal(vim.api.nvim_get_current_win(), panel.win)
+  press('<Tab>')
+  equal(vim.api.nvim_get_current_win(), float)
+  equal(git_stats().decision_posts, before, 'focus switching submitted a decision')
 
   -- The row behind the float is an expired ticket, which the broker cannot
   -- decide. If the keystroke read the cursor instead of the preview, the
@@ -965,7 +996,7 @@ local function test_the_preview_decides_the_ticket_it_shows()
   point_at(git_ids.overdue)
 
   without_prompts(function()
-    vim.api.nvim_feedkeys('a', 'x', false)
+    vim.api.nvim_feedkeys('y', 'x', false)
     wait_for(function()
       local _, current = async(function(done) git_client():get(git_ids.preview, done) end)
       return current and current.status == 'approved'
@@ -983,8 +1014,8 @@ local function test_the_preview_decides_the_ticket_it_shows()
     '**Status:** approved')
 
   -- q closes the preview and leaves the panel behind, decided row and all.
-  vim.api.nvim_feedkeys('q', 'x', false)
-  assert(not vim.api.nvim_win_is_valid(float), 'q did not close the preview')
+  vim.api.nvim_feedkeys('c', 'x', false)
+  equal(table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(float), 0, -1, false), '\n'), '')
   assert(panel.win and vim.api.nvim_win_is_valid(panel.win), 'q closed the panel')
 end
 
@@ -1029,7 +1060,8 @@ local function test_closing_the_panel_takes_the_preview_with_it()
   -- float as the only window if the panel closes first.
   vim.api.nvim_set_current_win(panel.win)
   panel.close()
-  assert(not vim.api.nvim_win_is_valid(float),
+  assert(not vim.api.nvim_win_is_valid(float) or
+    not vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(float)):find('mcpbuff://', 1, true),
     'the preview outlived the panel it belongs to')
   for _, window in ipairs(vim.api.nvim_list_wins()) do
     assert(vim.api.nvim_win_get_buf(window) ~= panel.buf,

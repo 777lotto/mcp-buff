@@ -204,8 +204,8 @@ separate call sites that are careful.
 
 ## The two tabs
 
-`:McpBuff` opens one panel with a tab per configured broker. `<Tab>` and
-`<S-Tab>` cycle; `1` and `2` jump; `:McpBuff cloudflare` and `:McpBuff github`
+`:McpBuff` opens an overview and a right-hand context pane. `1` and `2`
+switch broker tabs; `:McpBuff cloudflare` and `:McpBuff github`
 open straight to one. The tab bar carries each broker's pending ticket count
 and a `*` when that tab has unapplied permission edits, so a tab you are not
 looking at can still ask for attention.
@@ -430,35 +430,38 @@ Mappings are local to the panel buffer:
 
 | Key       | Action                                                                         |
 | --------- | ------------------------------------------------------------------------------ |
-| `<Tab>`   | Next broker tab                                                                |
-| `<S-Tab>` | Previous broker tab                                                            |
+| `<Tab>`   | Switch pane focus                                                                |
+| `<S-Tab>` | Switch pane focus                                                            |
 | `1` … `N` | Jump to a broker tab                                                           |
 | `<CR>`    | On a ticket, fetch and open it in full; on a permission, toggle it locally     |
-| `a`       | Re-fetch, verify, show the payload, and approve                                |
-| `d`       | Re-fetch, verify, show the payload, and deny with an optional note             |
+| `y`       | Re-fetch, verify, show the payload, and approve                                |
+| `n`       | Re-fetch, verify, show the payload, and deny with an optional note             |
 | `<Space>` | Toggle a runtime permission locally                                            |
 | `A`       | Apply this tab's permission changes after typed state-digest confirmation      |
+| `c`       | Clear context and focus the overview                                           |
+| `>` / `<` | Next / previous ticket across categories                                       |
 | `r`       | Refresh this tab                                                               |
 | `q`       | Close the panel and every managed tunnel                                       |
 
 `<NL>` and keypad Enter work like `<CR>`, matching terminal-safe GitPanel
 behavior.
 
-The detail window is a review surface, not a modal. `>` and `<` open the next
-and previous ticket in the current status category; they stop at that
-category's ends. `<Tab>` and `<S-Tab>` cycle through non-empty ticket categories
-and open the top (newest) ticket in each. These moves only fetch detail: they do
-not approve, deny, or close anything, and the panel cursor follows the ticket
-shown. `a`, `d`, `r`, `<CR>`, and `1` … `N` also work inside the detail window;
-the number keys still switch broker tabs. `q` or `<Esc>` closes the float and
-leaves the panel behind.
+Enter opens a ticket in the context pane on the right and focuses it. Tab
+(or Shift-Tab) switches focus between the overview and context panes. The
+number keys switch broker tabs and clear the previous broker's context.
 
-A decision taken there acts on the ticket the window is showing, whatever the
-panel cursor was sitting on underneath. There is one detail window, reused:
-navigating, opening another ticket, or deciding this one replaces its contents
-rather than stacking another float on top. The preview owns its display
-filetype, starts each ticket at the top, and wraps long prose at word boundaries
-within the float, with continued lines indented for readability.
+In either pane, > opens the next ticket down the overview and < opens the
+previous ticket up, crossing status categories and skipping empty headings.
+Navigation stops at the first and last tickets. The overview cursor follows
+explicit navigation, but stays in its original category when a ticket changes
+status: it selects the next remaining ticket, or the preceding one at the end.
+
+Use y to approve and n to deny the ticket in the focused pane. The context
+updates in place when its ticket's decision settles, preserving focus and
+scroll position. A late decision never replaces another ticket opened since.
+Use c from either pane to empty the context and return to the overview; q or
+Esc in context also clears it. Long text wraps at word boundaries. Closing
+the panel restores the buffer previously displayed on the right.
 
 Closing the panel during an in-flight decision or permission update keeps that
 broker's owned route alive until the result is accounted for, then closes it.
@@ -484,7 +487,7 @@ finished. Folding it into `failed` would assert the request definitely did not
 happen; folding it into `pending` would offer a decision. Both are claims about
 a word the client does not know.
 
-A decision does not trust the cached list row. Pressing `a` or `d` re-fetches
+A decision does not trust the cached list row. Pressing `y` or `n` re-fetches
 the full ticket, refuses anything that broker cannot decide, and renders the
 reason, the expiry, the complete digest, what approval authorises, and every
 reviewable term of every stored request — for Cloudflare that is each method,
@@ -524,7 +527,7 @@ identical digest. That race is caught by the ticket state machine instead.
 
 ### The decision is a keystroke
 
-`a` approves and `d` denies, and neither asks you to retype anything. Every
+`y` approves and `n` denies, and neither asks you to retype anything. Every
 check that stands between the keystroke and the broker is the panel's own work:
 the ticket is re-read, its status is checked against what that broker can
 decide, and its digest is recomputed locally in that broker's domain and
@@ -541,14 +544,14 @@ that broker**, and one line per step naming the grant rather than the shape:
 Approving this ticket authorises no immediate action. It unlocks that scope for
 one later push, which is spent before a byte is forwarded and cannot be reused.
 
-`a` approves and `d` denies, here or in the list. The panel re-reads the ticket
+`y` approves and `n` denies, here or in the list. The panel re-reads the ticket
 and re-verifies this digest first, and asks for nothing else — so the terms
 above are what you are agreeing to.
 
 ### Step 0 · Workflow-changing push · 777lotto/zemrip · 1 ref
 ```
 
-So `a` on a list row opens that render and submits, and `a` inside the render
+So `y` on a list row opens that render and submits, and `y` inside the render
 submits what you have just read. Denial adds one prompt on purpose — an
 optional note, which `<Esc>` cancels and an empty answer skips — because a
 denial is the one decision that can carry a reason back to whoever asked.

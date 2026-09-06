@@ -299,41 +299,41 @@ and POST /permissions must be upgraded; do not weaken the admin boundary.
 
 The following mappings are local to the panel buffer:
 
-<Tab>           Next broker tab.
-<S-Tab>         Previous broker tab.
+<Tab>           Switch pane focus.
+<S-Tab>         Switch pane focus.
 1 .. N          Jump to a broker tab.
 <CR>            On a ticket row, re-fetch and open the full detail. On a
                 permission row, toggle it locally. LF and keypad Enter
                 perform the same action.
-a               Re-fetch and verify a decidable ticket, show the payload,
+y               Re-fetch and verify a decidable ticket, show the payload,
                 and approve it. Nothing further is asked for.
-d               The same, and deny it with an optional note.
+n               The same, and deny it with an optional note.
 <Space>         Toggle a runtime permission locally.
 A               Apply this tab's permission changes after typing the state
                 digest confirmation.
+c               Clear context and focus the overview.
+> / <           Next / previous ticket across categories.
 r               Refresh this tab.
 q               Close the panel and every managed tunnel. In the detail
-                window, q or <Esc> closes the float instead.
+                window, q or <Esc> clears context instead.
 
-The detail window is a review surface, not a modal.         *mcp-buff-preview*
-> and < open the next and previous ticket in the current status category and
-stop at its ends. <Tab> and <S-Tab> cycle through non-empty ticket categories,
-opening the top (newest) ticket in each. These keys only fetch ticket detail;
-they never decide a ticket or close the float. The panel cursor follows the
-ticket shown, so closing the preview returns to that row.
+Ticket context pane.                                     *mcp-buff-preview*
+Enter opens a ticket in the context pane on the right and focuses it. Tab
+(or Shift-Tab) switches focus between the overview and context panes. The
+number keys switch broker tabs and clear the previous broker's context.
 
-a, d, r, <CR> and 1 .. N also work inside the detail window; the number keys
-still switch broker tabs. A decision taken there acts on the ticket the window
-is showing, whatever the panel cursor sat on underneath it, and the permission
-keys are deliberately absent because the float has no permission rows to act
-on. q or <Esc> closes only the float.
+In either pane, > opens the next ticket down the overview and < opens the
+previous ticket up, crossing status categories and skipping empty headings.
+Navigation stops at the first and last tickets. The overview cursor follows
+explicit navigation, but stays in its original category when a ticket changes
+status: it selects the next remaining ticket, or the preceding one at the end.
 
-There is one detail window and it is reused. Navigating, opening another
-ticket, or deciding the one on screen replaces its contents; a decision
-therefore leaves the settled ticket in front of you rather than stacking a
-second float on top of the payload you just approved. Each ticket starts at the
-top. The preview owns its display filetype, long prose wraps at word boundaries
-inside the float, and continued lines retain a readable indent.
+Use y to approve and n to deny the ticket in the focused pane. The context
+updates in place when its ticket's decision settles, preserving focus and
+scroll position. A late decision never replaces another ticket opened since.
+Use c from either pane to empty the context and return to the overview; q or
+Esc in context also clears it. Long text wraps at word boundaries. Closing
+the panel restores the buffer previously displayed on the right.
 
 Closing the panel during an in-flight decision or permission update keeps that
 broker's owned route alive until the result is accounted for, then closes it.
@@ -390,7 +390,7 @@ caught by the ticket state machine instead.
 
 The decision is a keystroke                                 *mcp-buff-confirm*
 
-a approves and d denies, and neither asks you to retype anything. Every check
+y approves and n denies, and neither asks you to retype anything. Every check
 between the keystroke and the broker is McpBuff's own work: the ticket is
 re-read, its status is checked against what that broker can decide, and its
 digest is recomputed in that broker's domain and compared with the served one.
@@ -407,7 +407,7 @@ authorises on that broker, and one line per step naming the grant: >
     scope for one later push, which is spent before a byte is forwarded and
     cannot be reused.
 
-    `a` approves and `d` denies, here or in the list. The panel re-reads the
+    `y` approves and `n` denies, here or in the list. The panel re-reads the
     ticket and re-verifies this digest first, and asks for nothing else — so
     the terms above are what you are agreeing to.
 
